@@ -1,0 +1,48 @@
+﻿[package]
+name = "kira-fastq"
+description = "High-performance FASTQ reader with mmap-first design. Supports plain, gzip, and BGZF inputs; optional multi-line parsing; and explicit paired-end reading."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+repository = "https://github.com/ARyaskov/kira-fastq"
+keywords = [
+    "bioinformatics",
+    "genomics",
+    "sequence-alignment"
+]
+categories = [
+    "science",
+    "science::bioinformatics",
+    "science::bioinformatics::sequence-analysis",
+    "command-line-utilities"
+]
+
+[dependencies]
+memmap2 = "0.9"
+miniz_oxide = "0.9"
+memchr = "2.7"
+
+[dev-dependencies]
+criterion = "0.8"
+flate2 = "1.1"
+crc32fast = "1.5"
+
+[features]
+gzip-validate = []
+
+[[bench]]
+name = "newline"
+harness = false
+
+[[bench]]
+name = "parser"
+harness = false
+
+[[bench]]
+name = "mmap_vs_gzip"
+harness = false
+
+[[bench]]
+name = "end_to_end"
+harness = false
