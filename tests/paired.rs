@@ -1,30 +1,15 @@
-use std::io::Write;
-use std::path::PathBuf;
+mod common;
 
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use kira_fastq::{FastqError, PairedFastqReader, PairedWhich, ValidationMode};
-
-fn write_plain(path: &PathBuf, data: &[u8]) {
-    std::fs::write(path, data).expect("write");
-}
-
-fn write_gzip(path: &PathBuf, data: &[u8]) {
-    let file = std::fs::File::create(path).expect("create");
-    let mut enc = GzEncoder::new(file, Compression::default());
-    enc.write_all(data).expect("write");
-    enc.finish().expect("finish");
-}
 
 #[test]
 fn paired_plain_happy() {
-    let dir = std::env::temp_dir();
-    let r1 = dir.join("kira_pe_r1.fastq");
-    let r2 = dir.join("kira_pe_r2.fastq");
+    let r1 = common::unique_path("pe_r1.fastq");
+    let r2 = common::unique_path("pe_r2.fastq");
     let d1 = b"@r1 1\nACGT\n+\n!!!!\n@r2 1\nTT\n+\n##\n";
     let d2 = b"@r1 2\nACGT\n+\n!!!!\n@r2 2\nTT\n+\n##\n";
-    write_plain(&r1, d1);
-    write_plain(&r2, d2);
+    common::write_plain(&r1, d1);
+    common::write_plain(&r2, d2);
 
     let mut pe = PairedFastqReader::from_paths(&r1, &r2)
         .expect("open")
@@ -40,13 +25,10 @@ fn paired_plain_happy() {
 
 #[test]
 fn paired_gzip_happy() {
-    let dir = std::env::temp_dir();
-    let r1 = dir.join("kira_pe_r1.fastq.gz");
-    let r2 = dir.join("kira_pe_r2.fastq.gz");
-    let d1 = b"@r1\nACGT\n+\n!!!!\n";
-    let d2 = b"@r1\nACGT\n+\n!!!!\n";
-    write_gzip(&r1, d1);
-    write_gzip(&r2, d2);
+    let r1 = common::unique_path("pe_r1.fastq.gz");
+    let r2 = common::unique_path("pe_r2.fastq.gz");
+    common::write_gzip(&r1, b"@r1\nACGT\n+\n!!!!\n");
+    common::write_gzip(&r2, b"@r1\nACGT\n+\n!!!!\n");
 
     let mut pe = PairedFastqReader::from_paths(&r1, &r2)
         .expect("open")
@@ -59,13 +41,10 @@ fn paired_gzip_happy() {
 
 #[test]
 fn paired_length_mismatch_r2_shorter() {
-    let dir = std::env::temp_dir();
-    let r1 = dir.join("kira_pe_len_r1.fastq");
-    let r2 = dir.join("kira_pe_len_r2.fastq");
-    let d1 = b"@r1\nACGT\n+\n!!!!\n@r2\nTT\n+\n##\n";
-    let d2 = b"@r1\nACGT\n+\n!!!!\n";
-    write_plain(&r1, d1);
-    write_plain(&r2, d2);
+    let r1 = common::unique_path("pe_len_r1.fastq");
+    let r2 = common::unique_path("pe_len_r2.fastq");
+    common::write_plain(&r1, b"@r1\nACGT\n+\n!!!!\n@r2\nTT\n+\n##\n");
+    common::write_plain(&r2, b"@r1\nACGT\n+\n!!!!\n");
 
     let mut pe = PairedFastqReader::from_paths(&r1, &r2).expect("open");
     let _ = pe.next().expect("read").expect("pair1");
@@ -80,13 +59,10 @@ fn paired_length_mismatch_r2_shorter() {
 
 #[test]
 fn paired_length_mismatch_r1_shorter() {
-    let dir = std::env::temp_dir();
-    let r1 = dir.join("kira_pe_len_r1b.fastq");
-    let r2 = dir.join("kira_pe_len_r2b.fastq");
-    let d1 = b"@r1\nACGT\n+\n!!!!\n";
-    let d2 = b"@r1\nACGT\n+\n!!!!\n@r2\nTT\n+\n##\n";
-    write_plain(&r1, d1);
-    write_plain(&r2, d2);
+    let r1 = common::unique_path("pe_len_r1b.fastq");
+    let r2 = common::unique_path("pe_len_r2b.fastq");
+    common::write_plain(&r1, b"@r1\nACGT\n+\n!!!!\n");
+    common::write_plain(&r2, b"@r1\nACGT\n+\n!!!!\n@r2\nTT\n+\n##\n");
 
     let mut pe = PairedFastqReader::from_paths(&r1, &r2).expect("open");
     let _ = pe.next().expect("read").expect("pair1");
@@ -101,13 +77,10 @@ fn paired_length_mismatch_r1_shorter() {
 
 #[test]
 fn paired_id_mismatch_opt_in() {
-    let dir = std::env::temp_dir();
-    let r1 = dir.join("kira_pe_id_r1.fastq");
-    let r2 = dir.join("kira_pe_id_r2.fastq");
-    let d1 = b"@r1\nACGT\n+\n!!!!\n";
-    let d2 = b"@x1\nACGT\n+\n!!!!\n";
-    write_plain(&r1, d1);
-    write_plain(&r2, d2);
+    let r1 = common::unique_path("pe_id_r1.fastq");
+    let r2 = common::unique_path("pe_id_r2.fastq");
+    common::write_plain(&r1, b"@r1\nACGT\n+\n!!!!\n");
+    common::write_plain(&r2, b"@x1\nACGT\n+\n!!!!\n");
 
     let mut pe = PairedFastqReader::from_paths(&r1, &r2)
         .expect("open")
@@ -126,17 +99,15 @@ fn paired_id_mismatch_opt_in() {
 
 #[test]
 fn paired_validation_applies_to_both() {
-    let dir = std::env::temp_dir();
-    let r1 = dir.join("kira_pe_val_r1.fastq");
-    let r2 = dir.join("kira_pe_val_r2.fastq");
-    let d1 = b"@r1\nACGT\n+\n!!!!\n";
-    let d2 = b"@r1\nACGX\n+\n!!!!\n";
-    write_plain(&r1, d1);
-    write_plain(&r2, d2);
+    let r1 = common::unique_path("pe_val_r1.fastq");
+    let r2 = common::unique_path("pe_val_r2.fastq");
+    common::write_plain(&r1, b"@r1\nACGT\n+\n!!!!\n");
+    common::write_plain(&r2, b"@r1\nACGX\n+\n!!!!\n");
 
     let mut pe = PairedFastqReader::from_paths(&r1, &r2)
         .expect("open")
-        .with_validation(ValidationMode::BasesAndQualities);
+        .with_validation(ValidationMode::BasesAndQualities)
+        .with_alphabet(kira_fastq::Alphabet::AcgtnStrict);
     let err = pe.next().expect_err("should error");
     match err {
         FastqError::InvalidBase { byte, .. } => {
@@ -148,17 +119,50 @@ fn paired_validation_applies_to_both() {
 
 #[test]
 fn paired_mixed_plain_gzip() {
-    let dir = std::env::temp_dir();
-    let r1 = dir.join("kira_pe_mixed_r1.fastq");
-    let r2 = dir.join("kira_pe_mixed_r2.fastq.gz");
-    let d1 = b"@r1\nACGT\n+\n!!!!\n";
-    let d2 = b"@r1\nACGT\n+\n!!!!\n";
-    write_plain(&r1, d1);
-    write_gzip(&r2, d2);
+    let r1 = common::unique_path("pe_mixed_r1.fastq");
+    let r2 = common::unique_path("pe_mixed_r2.fastq.gz");
+    common::write_plain(&r1, b"@r1\nACGT\n+\n!!!!\n");
+    common::write_gzip(&r2, b"@r1\nACGT\n+\n!!!!\n");
 
     let mut pe = PairedFastqReader::from_paths(&r1, &r2).expect("open");
     let pair = pe.next().expect("read").expect("pair");
     assert_eq!(pair.0.header(), b"r1");
     assert_eq!(pair.1.header(), b"r1");
     assert!(pe.next().expect("read").is_none());
+}
+
+#[test]
+fn paired_classic_illumina_slash_pair_matches() {
+    let r1 = common::unique_path("pe_illumina_r1.fastq");
+    let r2 = common::unique_path("pe_illumina_r2.fastq");
+    common::write_plain(&r1, b"@HWUSI-EAS100R:6:73:941:1973#0/1\nACGT\n+\n!!!!\n");
+    common::write_plain(&r2, b"@HWUSI-EAS100R:6:73:941:1973#0/2\nACGT\n+\n!!!!\n");
+
+    let mut pe = PairedFastqReader::from_paths(&r1, &r2)
+        .expect("open")
+        .with_id_check(true);
+    let pair = pe.next().expect("read").expect("pair");
+    assert_eq!(pair.0.header(), b"HWUSI-EAS100R:6:73:941:1973#0/1");
+    assert_eq!(pair.1.header(), b"HWUSI-EAS100R:6:73:941:1973#0/2");
+}
+
+#[test]
+fn paired_casava_18_pair_matches() {
+    let r1 = common::unique_path("pe_casava_r1.fastq");
+    let r2 = common::unique_path("pe_casava_r2.fastq");
+    common::write_plain(
+        &r1,
+        b"@M01234:23:000000000-A1BCD:1:1101:12345:6789 1:N:0:NNNN\nACGT\n+\n!!!!\n",
+    );
+    common::write_plain(
+        &r2,
+        b"@M01234:23:000000000-A1BCD:1:1101:12345:6789 2:N:0:NNNN\nACGT\n+\n!!!!\n",
+    );
+
+    let mut pe = PairedFastqReader::from_paths(&r1, &r2)
+        .expect("open")
+        .with_id_check(true);
+    let pair = pe.next().expect("read").expect("pair");
+    assert!(pair.0.header().starts_with(b"M01234"));
+    assert!(pair.1.header().starts_with(b"M01234"));
 }

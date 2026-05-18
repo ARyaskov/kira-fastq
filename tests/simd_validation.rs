@@ -17,7 +17,7 @@ fn scalar_qual(buf: &[u8]) -> Result<(), usize> {
     let mut i = 0usize;
     while i < buf.len() {
         let b = buf[i];
-        if b < 33 || b > 126 {
+        if !(33..=126).contains(&b) {
             return Err(i);
         }
         i += 1;

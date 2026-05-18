@@ -1,8 +1,5 @@
-use std::io::Write;
-use std::path::PathBuf;
+mod common;
 
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use kira_fastq::{FastqError, FastqReader};
 
 fn lcg(seed: &mut u64) -> u8 {
@@ -37,9 +34,7 @@ fn gen_fastq(seed: &mut u64, records: usize, well_formed: bool) -> Vec<u8> {
         if !well_formed && (lcg(seed) & 3) == 0 {
             out.pop();
         }
-        if well_formed {
-            out.push(b'\n');
-        } else if (lcg(seed) & 7) != 0 {
+        if well_formed || (lcg(seed) & 7) != 0 {
             out.push(b'\n');
         }
         if !well_formed && (lcg(seed) & 7) == 0 {
@@ -52,18 +47,9 @@ fn gen_fastq(seed: &mut u64, records: usize, well_formed: bool) -> Vec<u8> {
     out
 }
 
-fn write_plain(path: &PathBuf, data: &[u8]) {
-    std::fs::write(path, data).expect("write");
-}
+type RecordTuple = (Vec<u8>, Vec<u8>, Vec<u8>);
 
-fn write_gzip(path: &PathBuf, data: &[u8]) {
-    let file = std::fs::File::create(path).expect("create");
-    let mut enc = GzEncoder::new(file, Compression::default());
-    enc.write_all(data).expect("write");
-    enc.finish().expect("finish");
-}
-
-fn run_reader(path: &PathBuf) -> Result<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>, FastqError> {
+fn run_reader(path: &std::path::PathBuf) -> Result<Vec<RecordTuple>, FastqError> {
     let mut out = Vec::new();
     let mut reader = FastqReader::from_path(path).expect("open");
     while let Some(rec) = reader.next()? {
@@ -85,11 +71,10 @@ fn fuzz_fastq_no_panic() {
     for _ in 0..50 {
         let records = 1 + (lcg(&mut seed) as usize % 50);
         let data = gen_fastq(&mut seed, records, false);
-        let dir = std::env::temp_dir();
-        let plain = dir.join("kira_fuzz_plain.fastq");
-        let gzip = dir.join("kira_fuzz_plain.fastq.gz");
-        write_plain(&plain, &data);
-        write_gzip(&gzip, &data);
+        let plain = common::unique_path("fuzz_plain.fastq");
+        let gzip = common::unique_path("fuzz_plain.fastq.gz");
+        common::write_plain(&plain, &data);
+        common::write_gzip(&gzip, &data);
 
         let _ = run_reader(&plain);
         let _ = run_reader(&gzip);
@@ -102,11 +87,10 @@ fn fuzz_plain_gzip_parity() {
     for _ in 0..20 {
         let records = 1 + (lcg(&mut seed) as usize % 50);
         let data = gen_fastq(&mut seed, records, true);
-        let dir = std::env::temp_dir();
-        let plain = dir.join("kira_fuzz_parity.fastq");
-        let gzip = dir.join("kira_fuzz_parity.fastq.gz");
-        write_plain(&plain, &data);
-        write_gzip(&gzip, &data);
+        let plain = common::unique_path("fuzz_parity.fastq");
+        let gzip = common::unique_path("fuzz_parity.fastq.gz");
+        common::write_plain(&plain, &data);
+        common::write_gzip(&gzip, &data);
         let a = run_reader(&plain).expect("plain");
         let b = run_reader(&gzip).expect("gzip");
         assert_eq!(a, b);
@@ -119,9 +103,8 @@ fn fuzz_error_offsets_monotonic() {
     for _ in 0..20 {
         let records = 1 + (lcg(&mut seed) as usize % 50);
         let data = gen_fastq(&mut seed, records, false);
-        let dir = std::env::temp_dir();
-        let plain = dir.join("kira_fuzz_offsets.fastq");
-        write_plain(&plain, &data);
+        let plain = common::unique_path("fuzz_offsets.fastq");
+        common::write_plain(&plain, &data);
         let mut reader = FastqReader::from_path(&plain).expect("open");
         let mut last = 0u64;
         loop {

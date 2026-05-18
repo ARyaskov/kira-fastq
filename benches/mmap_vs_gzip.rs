@@ -1,11 +1,16 @@
+use std::hint::black_box;
 use std::path::Path;
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use kira_fastq::FastqReader;
 
 fn bench_mmap_vs_gzip(c: &mut Criterion) {
     let plain = Path::new("benches/data/SRR014966.fastq");
     let gzip = Path::new("benches/data/SRR014966.fastq.gz");
+    if !plain.exists() || !gzip.exists() {
+        eprintln!("mmap_vs_gzip: skipping — supply benches/data/SRR014966.fastq{{,.gz}} to enable");
+        return;
+    }
     let plain_size = std::fs::metadata(plain).expect("stat").len();
     let mut group = c.benchmark_group("mmap_vs_gzip");
 

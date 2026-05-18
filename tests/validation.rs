@@ -1,20 +1,6 @@
-use std::io::Write;
-use std::path::PathBuf;
+mod common;
 
-use flate2::Compression;
-use flate2::write::GzEncoder;
-use kira_fastq::{FastqError, FastqReader, ValidationMode};
-
-fn write_plain(path: &PathBuf, data: &[u8]) {
-    std::fs::write(path, data).expect("write");
-}
-
-fn write_gzip(path: &PathBuf, data: &[u8]) {
-    let file = std::fs::File::create(path).expect("create");
-    let mut enc = GzEncoder::new(file, Compression::default());
-    enc.write_all(data).expect("write");
-    enc.finish().expect("finish");
-}
+use kira_fastq::{Alphabet, FastqError, FastqReader, ValidationMode};
 
 fn seq_start(data: &[u8]) -> u64 {
     let mut i = 0usize;
@@ -42,9 +28,8 @@ fn qual_start(data: &[u8]) -> u64 {
 #[test]
 fn validation_disabled_accepts_invalid() {
     let data = b"@r1\nACGTX\n+\n!!!!?\n";
-    let dir = std::env::temp_dir();
-    let path = dir.join("kira_fastq_invalid_default.fastq");
-    write_plain(&path, data);
+    let path = common::unique_path("val_disabled.fastq");
+    common::write_plain(&path, data);
     let mut reader = FastqReader::from_path(&path).expect("open");
     let rec = reader.next().expect("read").expect("rec");
     assert_eq!(rec.seq(), b"ACGTX");
@@ -53,12 +38,12 @@ fn validation_disabled_accepts_invalid() {
 #[test]
 fn bases_validation_plain() {
     let data = b"@r1\nACGTN\n+\n!!!!!\n";
-    let dir = std::env::temp_dir();
-    let path = dir.join("kira_fastq_valid_bases.fastq");
-    write_plain(&path, data);
+    let path = common::unique_path("val_bases.fastq");
+    common::write_plain(&path, data);
     let mut reader = FastqReader::from_path(&path)
         .expect("open")
-        .with_validation(ValidationMode::Bases);
+        .with_validation(ValidationMode::Bases)
+        .with_alphabet(Alphabet::AcgtnStrict);
     let rec = reader.next().expect("read").expect("rec");
     assert_eq!(rec.seq(), b"ACGTN");
 }
@@ -71,12 +56,12 @@ fn bases_validation_invalid_positions_plain() {
         (b"@r1\nACGTX\n+\n!!!!!\n".as_slice(), 4usize),
     ];
     for (data, bad_idx) in cases {
-        let dir = std::env::temp_dir();
-        let path = dir.join("kira_fastq_invalid_base.fastq");
-        write_plain(&path, data);
+        let path = common::unique_path("val_bad_base.fastq");
+        common::write_plain(&path, data);
         let mut reader = FastqReader::from_path(&path)
             .expect("open")
-            .with_validation(ValidationMode::Bases);
+            .with_validation(ValidationMode::Bases)
+            .with_alphabet(Alphabet::AcgtnStrict);
         let err = reader.next().expect_err("should error");
         match err {
             FastqError::InvalidBase { offset, byte } => {
@@ -91,9 +76,8 @@ fn bases_validation_invalid_positions_plain() {
 #[test]
 fn qualities_validation_invalid_plain() {
     let data = b"@r1\nACGT\n+\n!!!\x10\n";
-    let dir = std::env::temp_dir();
-    let path = dir.join("kira_fastq_invalid_qual.fastq");
-    write_plain(&path, data);
+    let path = common::unique_path("val_bad_qual.fastq");
+    common::write_plain(&path, data);
     let mut reader = FastqReader::from_path(&path)
         .expect("open")
         .with_validation(ValidationMode::Qualities);
@@ -110,12 +94,12 @@ fn qualities_validation_invalid_plain() {
 #[test]
 fn bases_and_qualities_gzip() {
     let data = b"@r1\nACGTN\n+\n!!!!!\n";
-    let dir = std::env::temp_dir();
-    let path = dir.join("kira_fastq_valid_both.fastq.gz");
-    write_gzip(&path, data);
+    let path = common::unique_path("val_both.fastq.gz");
+    common::write_gzip(&path, data);
     let mut reader = FastqReader::from_path(&path)
         .expect("open")
-        .with_validation(ValidationMode::BasesAndQualities);
+        .with_validation(ValidationMode::BasesAndQualities)
+        .with_alphabet(Alphabet::AcgtnStrict);
     let rec = reader.next().expect("read").expect("rec");
     assert_eq!(rec.seq(), b"ACGTN");
     assert_eq!(rec.qual(), b"!!!!!");
@@ -124,12 +108,12 @@ fn bases_and_qualities_gzip() {
 #[test]
 fn bases_validation_gzip_invalid() {
     let data = b"@r1\nACGTX\n+\n!!!!!\n";
-    let dir = std::env::temp_dir();
-    let path = dir.join("kira_fastq_invalid_base.fastq.gz");
-    write_gzip(&path, data);
+    let path = common::unique_path("val_bad_base.fastq.gz");
+    common::write_gzip(&path, data);
     let mut reader = FastqReader::from_path(&path)
         .expect("open")
-        .with_validation(ValidationMode::Bases);
+        .with_validation(ValidationMode::Bases)
+        .with_alphabet(Alphabet::AcgtnStrict);
     let err = reader.next().expect_err("should error");
     match err {
         FastqError::InvalidBase { offset, byte } => {
@@ -138,4 +122,19 @@ fn bases_validation_gzip_invalid() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn qualities_validation_accepts_full_phred_range() {
+    // Bytes 33..=126 are all valid; check binary boundary.
+    let mut data: Vec<u8> = Vec::from(b"@r1\nACGT\n+\n".as_slice());
+    data.extend_from_slice(b"!~?@");
+    data.push(b'\n');
+    let path = common::unique_path("val_qual_full.fastq");
+    common::write_plain(&path, &data);
+    let mut reader = FastqReader::from_path(&path)
+        .expect("open")
+        .with_validation(ValidationMode::Qualities);
+    let rec = reader.next().expect("read").expect("rec");
+    assert_eq!(rec.qual(), b"!~?@");
 }

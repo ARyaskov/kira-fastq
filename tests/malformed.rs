@@ -1,12 +1,8 @@
+mod common;
+
 use std::path::Path;
 
-#[cfg(feature = "gzip-validate")]
-use flate2::Compression;
-#[cfg(feature = "gzip-validate")]
-use flate2::write::GzEncoder;
 use kira_fastq::{FastqError, FastqReader, InvalidKind};
-#[cfg(feature = "gzip-validate")]
-use std::io::Write;
 
 #[test]
 fn bad_header() {
@@ -71,8 +67,9 @@ fn length_mismatch() {
 
 #[test]
 fn bad_header_gzip() {
-    let path = Path::new("tests/data/gzip_bad_header.fastq.gz");
-    let mut reader = FastqReader::from_path(path).expect("open");
+    let path = common::unique_path("bad_header.fastq.gz");
+    common::write_gzip(&path, b"r1\nACGT\n+\n!!!!\n");
+    let mut reader = FastqReader::from_path(&path).expect("open");
     let err = reader.next().expect_err("should error");
     match err {
         FastqError::InvalidFormat { offset, kind } => {
@@ -85,8 +82,9 @@ fn bad_header_gzip() {
 
 #[test]
 fn bad_plus_gzip() {
-    let path = Path::new("tests/data/gzip_bad_plus.fastq.gz");
-    let mut reader = FastqReader::from_path(path).expect("open");
+    let path = common::unique_path("bad_plus.fastq.gz");
+    common::write_gzip(&path, b"@r1\nACGT\nx\n!!!!\n");
+    let mut reader = FastqReader::from_path(&path).expect("open");
     let err = reader.next().expect_err("should error");
     match err {
         FastqError::InvalidFormat { offset, kind } => {
@@ -99,8 +97,9 @@ fn bad_plus_gzip() {
 
 #[test]
 fn length_mismatch_gzip() {
-    let path = Path::new("tests/data/gzip_bad_len.fastq.gz");
-    let mut reader = FastqReader::from_path(path).expect("open");
+    let path = common::unique_path("bad_len.fastq.gz");
+    common::write_gzip(&path, b"@r1\nACGT\n+\n!!!\n");
+    let mut reader = FastqReader::from_path(&path).expect("open");
     let err = reader.next().expect_err("should error");
     match err {
         FastqError::LengthMismatch {
@@ -119,8 +118,11 @@ fn length_mismatch_gzip() {
 #[cfg(feature = "gzip-validate")]
 #[test]
 fn gzip_trailer_crc_mismatch() {
-    let dir = std::env::temp_dir();
-    let path = dir.join("kira_fastq_bad_crc.fastq.gz");
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let path = common::unique_path("bad_crc.fastq.gz");
     let data = b"@r1\nACGT\n+\n!!!!\n";
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     enc.write_all(data).expect("write");

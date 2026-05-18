@@ -1,8 +1,5 @@
-use std::io::Write;
-use std::path::PathBuf;
+mod common;
 
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use kira_fastq::FastqReader;
 
 fn lcg(seed: &mut u64) -> u8 {
@@ -14,7 +11,7 @@ fn make_records(count: usize, seed: &mut u64) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let len = 20 + (lcg(seed) as usize % 80);
-        let mut header = format!("r{}", i + 1).into_bytes();
+        let header = format!("r{}", i + 1).into_bytes();
         let mut seq = vec![0u8; len];
         let mut qual = vec![0u8; len];
         for j in 0..len {
@@ -25,14 +22,14 @@ fn make_records(count: usize, seed: &mut u64) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)
                 2 => b'G',
                 _ => b'T',
             };
-            qual[j] = (33 + (lcg(seed) % 40)) as u8;
+            qual[j] = 33 + (lcg(seed) % 40);
         }
-        out.push((header.drain(..).collect(), seq, qual));
+        out.push((header, seq, qual));
     }
     out
 }
 
-fn write_fastq(path: &PathBuf, records: &[(Vec<u8>, Vec<u8>, Vec<u8>)]) {
+fn write_fastq(path: &std::path::PathBuf, records: &[(Vec<u8>, Vec<u8>, Vec<u8>)]) {
     let mut out = Vec::new();
     for (h, s, q) in records {
         out.extend_from_slice(b"@");
@@ -46,25 +43,17 @@ fn write_fastq(path: &PathBuf, records: &[(Vec<u8>, Vec<u8>, Vec<u8>)]) {
     std::fs::write(path, out).expect("write");
 }
 
-fn write_gzip(path: &PathBuf, data: &[u8]) {
-    let file = std::fs::File::create(path).expect("create");
-    let mut enc = GzEncoder::new(file, Compression::default());
-    enc.write_all(data).expect("write");
-    enc.finish().expect("finish");
-}
-
 #[test]
 fn plain_and_gzip_match() {
     let mut seed = 0x1357_9bdf_2468_ace0u64;
     let records = make_records(500, &mut seed);
 
-    let dir = std::env::temp_dir();
-    let plain_path = dir.join("kira_fastq_fuzz_plain.fastq");
-    let gzip_path = dir.join("kira_fastq_fuzz_plain.fastq.gz");
+    let plain_path = common::unique_path("fuzz_like_plain.fastq");
+    let gzip_path = common::unique_path("fuzz_like_plain.fastq.gz");
 
     write_fastq(&plain_path, &records);
     let data = std::fs::read(&plain_path).expect("read");
-    write_gzip(&gzip_path, &data);
+    common::write_gzip(&gzip_path, &data);
 
     let mut plain = FastqReader::from_path(&plain_path).expect("open");
     let mut gzip = FastqReader::from_path(&gzip_path).expect("open");

@@ -5,7 +5,7 @@ use crate::format::FastqFormat;
 use crate::parser::ParsedRecord;
 use crate::reader::FastqReader;
 use crate::record::FastqRecord;
-use crate::validation::ValidationMode;
+use crate::validation::{Alphabet, ValidationMode};
 
 pub struct PairedFastqReader {
     r1: FastqReader,
@@ -28,10 +28,23 @@ impl PairedFastqReader {
     }
 
     #[inline]
-    pub fn with_validation(mut self, mode: ValidationMode) -> Self {
-        self.r1 = self.r1.with_validation(mode);
-        self.r2 = self.r2.with_validation(mode);
-        self
+    pub fn with_validation(self, mode: ValidationMode) -> Self {
+        let Self { r1, r2, id_check } = self;
+        Self {
+            r1: r1.with_validation(mode),
+            r2: r2.with_validation(mode),
+            id_check,
+        }
+    }
+
+    #[inline]
+    pub fn with_alphabet(self, alphabet: Alphabet) -> Self {
+        let Self { r1, r2, id_check } = self;
+        Self {
+            r1: r1.with_alphabet(alphabet),
+            r2: r2.with_alphabet(alphabet),
+            id_check,
+        }
     }
 
     #[inline]
@@ -41,20 +54,19 @@ impl PairedFastqReader {
     }
 
     #[inline]
-    pub fn with_format(mut self, format: FastqFormat) -> Self {
-        self.r1 = self.r1.with_format(format);
-        self.r2 = self.r2.with_format(format);
-        self
+    pub fn with_format(self, format: FastqFormat) -> Self {
+        let Self { r1, r2, id_check } = self;
+        Self {
+            r1: r1.with_format(format),
+            r2: r2.with_format(format),
+            id_check,
+        }
     }
 
     pub fn next(&mut self) -> Result<Option<(FastqRecord<'_>, FastqRecord<'_>)>, FastqError> {
-        let r1_ptr = &mut self.r1 as *mut FastqReader;
-        let r2_ptr = &mut self.r2 as *mut FastqReader;
-
-        // SAFETY: r1 and r2 are distinct fields; we never alias mutable borrows.
-        let a = unsafe { (*r1_ptr).next_parsed()? };
-        // SAFETY: r1 and r2 are distinct fields; we never alias mutable borrows.
-        let b = unsafe { (*r2_ptr).next_parsed()? };
+        let Self { r1, r2, id_check } = self;
+        let a = r1.next_parsed()?;
+        let b = r2.next_parsed()?;
 
         match (a, b) {
             (None, None) => Ok(None),
@@ -65,7 +77,7 @@ impl PairedFastqReader {
                 which: PairedWhich::R1,
             }),
             (Some(a), Some(b)) => {
-                if self.id_check && !ids_match(&a, &b) {
+                if *id_check && !ids_match(&a, &b) {
                     return Err(FastqError::PairedIdMismatch {
                         offset_r1: a.header_start,
                         offset_r2: b.header_start,
@@ -79,18 +91,24 @@ impl PairedFastqReader {
 
 #[inline]
 fn ids_match(a: &ParsedRecord<'_>, b: &ParsedRecord<'_>) -> bool {
-    id_prefix(a.record.header()) == id_prefix(b.record.header())
+    canonical_read_id(a.record.header()) == canonical_read_id(b.record.header())
 }
 
-#[inline]
-fn id_prefix(header: &[u8]) -> &[u8] {
-    let mut i = 0usize;
-    while i < header.len() {
-        let b = header[i];
+// Trim whitespace-suffix (Casava 1.8+ comments) then trailing `/N` (classic Illumina ≤1.7).
+pub fn canonical_read_id(header: &[u8]) -> &[u8] {
+    let mut end = header.len();
+    for (i, &b) in header.iter().enumerate() {
         if b == b' ' || b == b'\t' {
+            end = i;
             break;
         }
-        i += 1;
     }
-    &header[..i]
+    let prefix = &header[..end];
+    if prefix.len() >= 2
+        && prefix[prefix.len() - 2] == b'/'
+        && prefix[prefix.len() - 1].is_ascii_digit()
+    {
+        return &prefix[..prefix.len() - 2];
+    }
+    prefix
 }

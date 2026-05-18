@@ -1,9 +1,36 @@
 use crate::backend::bgzf::BgzfBackend;
-use crate::backend::gzip::GzipBackend;
+use crate::backend::gzip::{GzipBackend, LineStatus};
 use crate::error::{FastqError, InvalidKind};
-use crate::parser::{ParsedRecord, Segment};
+use crate::parser::{ParsedRecord, RecordScratch, Segment};
 use crate::record::FastqRecord;
 use crate::simd::newline::find_lf;
+
+pub trait LineSource {
+    fn read_line(&mut self, out: &mut Vec<u8>) -> Result<LineStatus, FastqError>;
+    fn logical_offset(&self) -> u64;
+}
+
+impl LineSource for GzipBackend {
+    #[inline]
+    fn read_line(&mut self, out: &mut Vec<u8>) -> Result<LineStatus, FastqError> {
+        GzipBackend::read_line(self, out)
+    }
+    #[inline]
+    fn logical_offset(&self) -> u64 {
+        GzipBackend::logical_offset(self)
+    }
+}
+
+impl LineSource for BgzfBackend {
+    #[inline]
+    fn read_line(&mut self, out: &mut Vec<u8>) -> Result<LineStatus, FastqError> {
+        BgzfBackend::read_line(self, out)
+    }
+    #[inline]
+    fn logical_offset(&self) -> u64 {
+        BgzfBackend::logical_offset(self)
+    }
+}
 
 pub struct MultiLineFastqParser;
 
@@ -13,63 +40,63 @@ impl MultiLineFastqParser {
         Self
     }
 
-    pub fn next_record<'a>(
+    pub fn next_record_in_slice<'a>(
         &mut self,
         buf: &'a [u8],
         pos: &mut usize,
-        seq_buf: &'a mut Vec<u8>,
-        qual_buf: &'a mut Vec<u8>,
+        scratch: &'a mut RecordScratch,
         seq_segs: &mut Vec<Segment>,
         qual_segs: &mut Vec<Segment>,
     ) -> Result<Option<ParsedRecord<'a>>, FastqError> {
-        let header_start = *pos;
-        let header = match next_line(buf, pos) {
-            LineResult::Line(line) => line,
-            LineResult::EofNoBytes => return Ok(None),
-            LineResult::EofPartial => {
+        let header_start = *pos as u64;
+        let header = match next_line_in_slice(buf, pos) {
+            Line::Line(line) => line,
+            Line::EofClean => return Ok(None),
+            Line::EofPartial => {
                 return Err(FastqError::UnexpectedEof {
-                    offset: header_start as u64,
+                    offset: header_start,
                 });
             }
         };
         if header.is_empty() || header[0] != b'@' {
             return Err(FastqError::InvalidFormat {
-                offset: header_start as u64,
+                offset: header_start,
                 kind: InvalidKind::HeaderMissingAt,
             });
         }
-        let header = &header[1..];
+        scratch.header.clear();
+        scratch.header.extend_from_slice(&header[1..]);
 
-        seq_buf.clear();
+        scratch.seq.clear();
         seq_segs.clear();
         let seq_start = *pos as u64;
-        let plus_start = loop {
-            let line_start = *pos;
-            let line = match next_line(buf, pos) {
-                LineResult::Line(line) => line,
-                LineResult::EofNoBytes | LineResult::EofPartial => {
-                    return Err(FastqError::UnexpectedEof {
-                        offset: line_start as u64,
-                    });
+        let plus_start;
+        loop {
+            let line_start = *pos as u64;
+            let line = match next_line_in_slice(buf, pos) {
+                Line::Line(line) => line,
+                Line::EofClean | Line::EofPartial => {
+                    return Err(FastqError::UnexpectedEof { offset: line_start });
                 }
             };
             if line.is_empty() {
                 return Err(FastqError::InvalidFormat {
-                    offset: line_start as u64,
+                    offset: line_start,
                     kind: InvalidKind::SeqLineEmpty,
                 });
             }
             if line[0] == b'+' {
-                break line_start as u64;
+                plus_start = line_start;
+                break;
             }
-            seq_buf.extend_from_slice(line);
+            scratch.seq.extend_from_slice(line);
             seq_segs.push(Segment {
-                offset: line_start as u64,
+                offset: line_start,
                 len: line.len(),
             });
-        };
+        }
 
-        if seq_buf.is_empty() {
+        if scratch.seq.is_empty() {
             return Err(FastqError::InvalidFormat {
                 offset: plus_start,
                 kind: InvalidKind::SeqLineEmpty,
@@ -77,123 +104,14 @@ impl MultiLineFastqParser {
         }
 
         let qual_start = *pos as u64;
-        qual_buf.clear();
+        scratch.qual.clear();
         qual_segs.clear();
-        let mut remaining = seq_buf.len();
+        let mut remaining = scratch.seq.len();
         while remaining > 0 {
-            let line_start = *pos;
-            let line = match next_line(buf, pos) {
-                LineResult::Line(line) => line,
-                LineResult::EofNoBytes | LineResult::EofPartial => {
-                    return Err(FastqError::UnexpectedEof {
-                        offset: line_start as u64,
-                    });
-                }
-            };
-            if line.is_empty() {
-                return Err(FastqError::InvalidFormat {
-                    offset: line_start as u64,
-                    kind: InvalidKind::QualLineEmpty,
-                });
-            }
-            if line.len() > remaining {
-                return Err(FastqError::LengthMismatch {
-                    offset: line_start as u64,
-                    seq_len: seq_buf.len(),
-                    qual_len: qual_buf.len() + line.len(),
-                });
-            }
-            qual_buf.extend_from_slice(line);
-            qual_segs.push(Segment {
-                offset: line_start as u64,
-                len: line.len(),
-            });
-            remaining -= line.len();
-        }
-
-        Ok(Some(ParsedRecord {
-            record: FastqRecord::new(header, seq_buf.as_slice(), qual_buf.as_slice()),
-            header_start: header_start as u64,
-            seq_start,
-            qual_start,
-        }))
-    }
-
-    pub fn next_record_gzip<'a>(
-        &mut self,
-        backend: &'a mut GzipBackend,
-        seq_buf: &'a mut Vec<u8>,
-        qual_buf: &'a mut Vec<u8>,
-        seq_segs: &mut Vec<Segment>,
-        qual_segs: &mut Vec<Segment>,
-    ) -> Result<Option<ParsedRecord<'a>>, FastqError> {
-        let backend_ptr = backend as *mut GzipBackend;
-        // SAFETY: backend_ptr is valid for the duration of this call.
-        let header_start = unsafe { (*backend_ptr).logical_offset() };
-        let header = match unsafe { next_line_gzip(backend_ptr)? } {
-            LineResult::Line(line) => line,
-            LineResult::EofNoBytes => return Ok(None),
-            LineResult::EofPartial => {
-                return Err(FastqError::UnexpectedEof {
-                    offset: header_start,
-                });
-            }
-        };
-        if header.is_empty() || header[0] != b'@' {
-            return Err(FastqError::InvalidFormat {
-                offset: header_start,
-                kind: InvalidKind::HeaderMissingAt,
-            });
-        }
-        let header = &header[1..];
-
-        seq_buf.clear();
-        seq_segs.clear();
-        // SAFETY: backend_ptr is valid for the duration of this call.
-        let seq_start = unsafe { (*backend_ptr).logical_offset() };
-        let plus_start = loop {
-            // SAFETY: backend_ptr is valid for the duration of this call.
-            let line_start = unsafe { (*backend_ptr).logical_offset() };
-            let line = match unsafe { next_line_gzip(backend_ptr)? } {
-                LineResult::Line(line) => line,
-                LineResult::EofNoBytes | LineResult::EofPartial => {
-                    return Err(FastqError::UnexpectedEof { offset: line_start });
-                }
-            };
-            if line.is_empty() {
-                return Err(FastqError::InvalidFormat {
-                    offset: line_start,
-                    kind: InvalidKind::SeqLineEmpty,
-                });
-            }
-            if line[0] == b'+' {
-                break line_start;
-            }
-            seq_buf.extend_from_slice(line);
-            seq_segs.push(Segment {
-                offset: line_start,
-                len: line.len(),
-            });
-        };
-
-        if seq_buf.is_empty() {
-            return Err(FastqError::InvalidFormat {
-                offset: plus_start,
-                kind: InvalidKind::SeqLineEmpty,
-            });
-        }
-
-        // SAFETY: backend_ptr is valid for the duration of this call.
-        let qual_start = unsafe { (*backend_ptr).logical_offset() };
-        qual_buf.clear();
-        qual_segs.clear();
-        let mut remaining = seq_buf.len();
-        while remaining > 0 {
-            // SAFETY: backend_ptr is valid for the duration of this call.
-            let line_start = unsafe { (*backend_ptr).logical_offset() };
-            let line = match unsafe { next_line_gzip(backend_ptr)? } {
-                LineResult::Line(line) => line,
-                LineResult::EofNoBytes | LineResult::EofPartial => {
+            let line_start = *pos as u64;
+            let line = match next_line_in_slice(buf, pos) {
+                Line::Line(line) => line,
+                Line::EofClean | Line::EofPartial => {
                     return Err(FastqError::UnexpectedEof { offset: line_start });
                 }
             };
@@ -206,11 +124,11 @@ impl MultiLineFastqParser {
             if line.len() > remaining {
                 return Err(FastqError::LengthMismatch {
                     offset: line_start,
-                    seq_len: seq_buf.len(),
-                    qual_len: qual_buf.len() + line.len(),
+                    seq_len: scratch.seq.len(),
+                    qual_len: scratch.qual.len() + line.len(),
                 });
             }
-            qual_buf.extend_from_slice(line);
+            scratch.qual.extend_from_slice(line);
             qual_segs.push(Segment {
                 offset: line_start,
                 len: line.len(),
@@ -219,114 +137,122 @@ impl MultiLineFastqParser {
         }
 
         Ok(Some(ParsedRecord {
-            record: FastqRecord::new(header, seq_buf.as_slice(), qual_buf.as_slice()),
+            record: FastqRecord::new(&scratch.header, &scratch.seq, &scratch.qual),
             header_start,
             seq_start,
             qual_start,
         }))
     }
 
-    pub fn next_record_bgzf<'a>(
+    pub fn next_record_stream<'a, B: LineSource>(
         &mut self,
-        backend: &'a mut BgzfBackend,
-        seq_buf: &'a mut Vec<u8>,
-        qual_buf: &'a mut Vec<u8>,
+        backend: &mut B,
+        scratch: &'a mut RecordScratch,
         seq_segs: &mut Vec<Segment>,
         qual_segs: &mut Vec<Segment>,
     ) -> Result<Option<ParsedRecord<'a>>, FastqError> {
-        let backend_ptr = backend as *mut BgzfBackend;
-        // SAFETY: backend_ptr is valid for the duration of this call.
-        let header_start = unsafe { (*backend_ptr).logical_offset() };
-        let header = match unsafe { next_line_bgzf(backend_ptr)? } {
-            LineResult::Line(line) => line,
-            LineResult::EofNoBytes => return Ok(None),
-            LineResult::EofPartial => {
+        let header_start = backend.logical_offset();
+        match backend.read_line(&mut scratch.header)? {
+            LineStatus::Line => {}
+            LineStatus::EofClean => return Ok(None),
+            LineStatus::EofPartial => {
                 return Err(FastqError::UnexpectedEof {
                     offset: header_start,
                 });
             }
-        };
-        if header.is_empty() || header[0] != b'@' {
+        }
+        if scratch.header.is_empty() || scratch.header[0] != b'@' {
             return Err(FastqError::InvalidFormat {
                 offset: header_start,
                 kind: InvalidKind::HeaderMissingAt,
             });
         }
-        let header = &header[1..];
+        scratch.header.drain(..1);
 
-        seq_buf.clear();
+        scratch.seq.clear();
         seq_segs.clear();
-        // SAFETY: backend_ptr is valid for the duration of this call.
-        let seq_start = unsafe { (*backend_ptr).logical_offset() };
-        let plus_start = loop {
-            // SAFETY: backend_ptr is valid for the duration of this call.
-            let line_start = unsafe { (*backend_ptr).logical_offset() };
-            let line = match unsafe { next_line_bgzf(backend_ptr)? } {
-                LineResult::Line(line) => line,
-                LineResult::EofNoBytes | LineResult::EofPartial => {
+        let seq_start = backend.logical_offset();
+        let plus_start;
+        // `mem::take` keeps disjoint mutable borrows on scratch fields possible.
+        let mut tmp = std::mem::take(&mut scratch.plus);
+        loop {
+            let line_start = backend.logical_offset();
+            tmp.clear();
+            match backend.read_line(&mut tmp)? {
+                LineStatus::Line => {}
+                LineStatus::EofClean | LineStatus::EofPartial => {
+                    scratch.plus = tmp;
                     return Err(FastqError::UnexpectedEof { offset: line_start });
                 }
-            };
-            if line.is_empty() {
+            }
+            if tmp.is_empty() {
+                scratch.plus = tmp;
                 return Err(FastqError::InvalidFormat {
                     offset: line_start,
                     kind: InvalidKind::SeqLineEmpty,
                 });
             }
-            if line[0] == b'+' {
-                break line_start;
+            if tmp[0] == b'+' {
+                plus_start = line_start;
+                break;
             }
-            seq_buf.extend_from_slice(line);
+            scratch.seq.extend_from_slice(&tmp);
             seq_segs.push(Segment {
                 offset: line_start,
-                len: line.len(),
+                len: tmp.len(),
             });
-        };
+        }
+        scratch.plus = tmp;
 
-        if seq_buf.is_empty() {
+        if scratch.seq.is_empty() {
             return Err(FastqError::InvalidFormat {
                 offset: plus_start,
                 kind: InvalidKind::SeqLineEmpty,
             });
         }
 
-        // SAFETY: backend_ptr is valid for the duration of this call.
-        let qual_start = unsafe { (*backend_ptr).logical_offset() };
-        qual_buf.clear();
+        let qual_start = backend.logical_offset();
+        scratch.qual.clear();
         qual_segs.clear();
-        let mut remaining = seq_buf.len();
+        let mut remaining = scratch.seq.len();
+        let mut tmp = std::mem::take(&mut scratch.plus);
         while remaining > 0 {
-            // SAFETY: backend_ptr is valid for the duration of this call.
-            let line_start = unsafe { (*backend_ptr).logical_offset() };
-            let line = match unsafe { next_line_bgzf(backend_ptr)? } {
-                LineResult::Line(line) => line,
-                LineResult::EofNoBytes | LineResult::EofPartial => {
+            let line_start = backend.logical_offset();
+            tmp.clear();
+            match backend.read_line(&mut tmp)? {
+                LineStatus::Line => {}
+                LineStatus::EofClean | LineStatus::EofPartial => {
+                    scratch.plus = tmp;
                     return Err(FastqError::UnexpectedEof { offset: line_start });
                 }
-            };
-            if line.is_empty() {
+            }
+            if tmp.is_empty() {
+                scratch.plus = tmp;
                 return Err(FastqError::InvalidFormat {
                     offset: line_start,
                     kind: InvalidKind::QualLineEmpty,
                 });
             }
-            if line.len() > remaining {
+            if tmp.len() > remaining {
+                let qlen = scratch.qual.len() + tmp.len();
+                scratch.plus = tmp;
                 return Err(FastqError::LengthMismatch {
                     offset: line_start,
-                    seq_len: seq_buf.len(),
-                    qual_len: qual_buf.len() + line.len(),
+                    seq_len: scratch.seq.len(),
+                    qual_len: qlen,
                 });
             }
-            qual_buf.extend_from_slice(line);
+            scratch.qual.extend_from_slice(&tmp);
             qual_segs.push(Segment {
                 offset: line_start,
-                len: line.len(),
+                len: tmp.len(),
             });
-            remaining -= line.len();
+            remaining -= tmp.len();
         }
+        scratch.plus = tmp;
 
         Ok(Some(ParsedRecord {
-            record: FastqRecord::new(header, seq_buf.as_slice(), qual_buf.as_slice()),
+            record: FastqRecord::new(&scratch.header, &scratch.seq, &scratch.qual),
             header_start,
             seq_start,
             qual_start,
@@ -334,91 +260,27 @@ impl MultiLineFastqParser {
     }
 }
 
-enum LineResult<'a> {
+#[allow(clippy::enum_variant_names)]
+enum Line<'a> {
     Line(&'a [u8]),
-    EofNoBytes,
+    EofClean,
     EofPartial,
 }
 
 #[inline]
-fn next_line<'a>(buf: &'a [u8], pos: &mut usize) -> LineResult<'a> {
+fn next_line_in_slice<'a>(buf: &'a [u8], pos: &mut usize) -> Line<'a> {
     let start = *pos;
     if start >= buf.len() {
-        return LineResult::EofNoBytes;
+        return Line::EofClean;
     }
     let lf = match find_lf(buf, start) {
         Some(idx) => idx,
-        None => return LineResult::EofPartial,
+        None => return Line::EofPartial,
     };
     let mut end = lf;
     if end > start && buf[end - 1] == b'\r' {
         end -= 1;
     }
     *pos = lf + 1;
-    LineResult::Line(&buf[start..end])
-}
-
-#[inline]
-unsafe fn next_line_gzip<'a>(backend: *mut GzipBackend) -> Result<LineResult<'a>, FastqError> {
-    loop {
-        // SAFETY: backend is a valid pointer for the duration of this function.
-        let slice = unsafe { (*backend).available_slice() };
-        if !slice.is_empty() {
-            if let Some(lf) = find_lf(slice, 0) {
-                let mut end = lf;
-                if end > 0 && slice[end - 1] == b'\r' {
-                    end -= 1;
-                }
-                let ptr = slice.as_ptr();
-                // SAFETY: advance does not invalidate `ptr` for the current slice.
-                unsafe { (*backend).advance(lf + 1) };
-                // SAFETY: `ptr` points to `slice` and `end` is within bounds.
-                let line = unsafe { std::slice::from_raw_parts(ptr, end) };
-                return Ok(LineResult::Line(line));
-            }
-            // For gzip, do not advance here; refill appends more output.
-        }
-
-        let had_bytes = !slice.is_empty();
-        // SAFETY: backend is valid for refill.
-        if !unsafe { (*backend).refill()? } {
-            return Ok(if had_bytes {
-                LineResult::EofPartial
-            } else {
-                LineResult::EofNoBytes
-            });
-        }
-    }
-}
-
-#[inline]
-unsafe fn next_line_bgzf<'a>(backend: *mut BgzfBackend) -> Result<LineResult<'a>, FastqError> {
-    loop {
-        // SAFETY: backend is a valid pointer for the duration of this function.
-        let slice = unsafe { (*backend).available_slice() };
-        if !slice.is_empty() {
-            if let Some(lf) = find_lf(slice, 0) {
-                let mut end = lf;
-                if end > 0 && slice[end - 1] == b'\r' {
-                    end -= 1;
-                }
-                let ptr = slice.as_ptr();
-                // SAFETY: advance does not invalidate `ptr` for the current slice.
-                unsafe { (*backend).advance(lf + 1) };
-                // SAFETY: `ptr` points to `slice` and `end` is within bounds.
-                let line = unsafe { std::slice::from_raw_parts(ptr, end) };
-                return Ok(LineResult::Line(line));
-            }
-        }
-
-        let had_bytes = !slice.is_empty();
-        // SAFETY: backend is valid for refill.
-        if !unsafe { (*backend).refill()? } {
-            return Ok(if had_bytes {
-                LineResult::EofPartial
-            } else {
-                LineResult::EofNoBytes
-            });
-        }
-    }
+    Line::Line(&buf[start..end])
 }

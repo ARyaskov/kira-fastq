@@ -1,3 +1,5 @@
+mod common;
+
 use std::path::Path;
 
 use kira_fastq::FastqError;
@@ -19,8 +21,9 @@ fn unexpected_eof() {
 
 #[test]
 fn unexpected_eof_gzip() {
-    let path = Path::new("tests/data/gzip_truncated.fastq.gz");
-    let mut reader = FastqReader::from_path(path).expect("open");
+    let path = common::unique_path("trunc.fastq.gz");
+    common::write_gzip(&path, b"@r1\nACGT\n+\n");
+    let mut reader = FastqReader::from_path(&path).expect("open");
     let err = reader.next().expect_err("should error");
     match err {
         FastqError::UnexpectedEof { offset } => {

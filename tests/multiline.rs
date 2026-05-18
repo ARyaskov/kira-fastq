@@ -1,3 +1,5 @@
+mod common;
+
 use std::path::Path;
 
 use kira_fastq::{FastqError, FastqFormat, FastqReader, PairedFastqReader, ValidationMode};
@@ -22,8 +24,10 @@ fn multiline_plain_happy() {
 
 #[test]
 fn multiline_gzip_happy() {
-    let path = Path::new("tests/data/multiline.fastq.gz");
-    let mut reader = FastqReader::from_path(path)
+    let plain = std::fs::read("tests/data/multiline.fastq").expect("read fixture");
+    let path = common::unique_path("multiline.fastq.gz");
+    common::write_gzip(&path, &plain);
+    let mut reader = FastqReader::from_path(&path)
         .expect("open")
         .with_format(FastqFormat::MultiLine);
     let r1 = reader.next().expect("read").expect("rec1");
@@ -73,14 +77,14 @@ fn multiline_qual_long() {
 
 #[test]
 fn multiline_validation() {
-    let dir = std::env::temp_dir();
-    let path = dir.join("kira_multiline_invalid.fastq");
+    let path = common::unique_path("multiline_invalid.fastq");
     std::fs::write(&path, b"@r1\nAC\nGTX\n+\n!!\n!!!\n").expect("write");
 
     let mut reader = FastqReader::from_path(&path)
         .expect("open")
         .with_format(FastqFormat::MultiLine)
-        .with_validation(ValidationMode::Bases);
+        .with_validation(ValidationMode::Bases)
+        .with_alphabet(kira_fastq::Alphabet::AcgtnStrict);
     let err = reader.next().expect_err("should error");
     match err {
         FastqError::InvalidBase { byte, .. } => {
@@ -92,9 +96,8 @@ fn multiline_validation() {
 
 #[test]
 fn multiline_paired() {
-    let dir = std::env::temp_dir();
-    let r1 = dir.join("kira_multiline_r1.fastq");
-    let r2 = dir.join("kira_multiline_r2.fastq");
+    let r1 = common::unique_path("multiline_r1.fastq");
+    let r2 = common::unique_path("multiline_r2.fastq");
     std::fs::write(&r1, b"@r1 1\nAC\nGT\n+\n!!!!\n!!\n").expect("write");
     std::fs::write(&r2, b"@r1 2\nAC\nGT\n+\n!!!!\n!!\n").expect("write");
 

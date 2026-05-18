@@ -1,6 +1,5 @@
 use std::fs::File;
 use std::io::Read;
-use std::marker::PhantomData;
 use std::path::Path;
 
 use crate::backend::Backend;
@@ -12,14 +11,12 @@ use crate::error::UnsupportedOperation;
 use crate::format::FastqFormat;
 use crate::multiline::MultiLineFastqParser;
 use crate::offset::VirtualOffset;
-use crate::parser::Segment;
-use crate::parser::{FastqParser, ParsedRecord};
+use crate::parser::{FastqParser, ParsedRecord, RecordScratch, Segment};
 use crate::record::FastqRecord;
-use crate::simd::bases::validate_bases;
+use crate::simd::bases::validate_bases_with;
 use crate::simd::newline::find_lf;
 use crate::simd::qual::validate_qual;
-use crate::validation::ValidationMode;
-use memchr::memchr_iter;
+use crate::validation::{Alphabet, ValidationMode};
 
 pub struct FastqReader {
     backend: Backend,
@@ -27,15 +24,16 @@ pub struct FastqReader {
     parser_multi: MultiLineFastqParser,
     pos: usize,
     validation: ValidationMode,
+    alphabet: Alphabet,
     format: FastqFormat,
-    ml_seq_buf: Vec<u8>,
-    ml_qual_buf: Vec<u8>,
-    ml_seq_segs: Vec<Segment>,
-    ml_qual_segs: Vec<Segment>,
+    scratch: RecordScratch,
+    seq_segs: Vec<Segment>,
+    qual_segs: Vec<Segment>,
     resync: bool,
 }
 
 impl FastqReader {
+    /// Backend is chosen from the file extension.
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, FastqError> {
         let path = path.as_ref();
         let backend = if is_bgzf(path) {
@@ -43,60 +41,48 @@ impl FastqReader {
         } else if is_gz(path) {
             Backend::Gzip(GzipBackend::new(path)?)
         } else {
-            Backend::Plain(MmapBackend::open(path)?)
+            let mmap = MmapBackend::open(path)?;
+            mmap.advise_sequential();
+            Backend::Plain(mmap)
         };
-        Ok(Self {
-            backend,
-            parser: FastqParser::new(),
-            parser_multi: MultiLineFastqParser::new(),
-            pos: 0,
-            validation: ValidationMode::None,
-            format: FastqFormat::SingleLine,
-            ml_seq_buf: Vec::new(),
-            ml_qual_buf: Vec::new(),
-            ml_seq_segs: Vec::new(),
-            ml_qual_segs: Vec::new(),
-            resync: false,
-        })
+        Ok(Self::with_backend(backend))
     }
 
+    /// Backend is chosen by sniffing the file's magic bytes.
     pub fn from_path_auto<P: AsRef<Path>>(path: P) -> Result<Self, FastqError> {
         let path = path.as_ref();
-        let kind = detect_compression(path).map_err(FastqError::Io)?;
+        let kind = detect_compression(path)?;
         let backend = match kind {
-            CompressionKind::Plain => Backend::Plain(MmapBackend::open(path)?),
+            CompressionKind::Plain => {
+                let mmap = MmapBackend::open(path)?;
+                mmap.advise_sequential();
+                Backend::Plain(mmap)
+            }
             CompressionKind::Gzip => Backend::Gzip(GzipBackend::new(path)?),
             CompressionKind::Bgzf => Backend::Bgzf(BgzfBackend::new(path)?),
         };
-        Ok(Self {
+        Ok(Self::with_backend(backend))
+    }
+
+    pub fn from_bgzf_path<P: AsRef<Path>>(path: P) -> Result<Self, FastqError> {
+        Ok(Self::with_backend(Backend::Bgzf(BgzfBackend::new(
+            path.as_ref(),
+        )?)))
+    }
+
+    fn with_backend(backend: Backend) -> Self {
+        Self {
             backend,
             parser: FastqParser::new(),
             parser_multi: MultiLineFastqParser::new(),
             pos: 0,
             validation: ValidationMode::None,
-            format: FastqFormat::SingleLine,
-            ml_seq_buf: Vec::new(),
-            ml_qual_buf: Vec::new(),
-            ml_seq_segs: Vec::new(),
-            ml_qual_segs: Vec::new(),
+            alphabet: Alphabet::default(),
+            format: FastqFormat::default(),
+            scratch: RecordScratch::new(),
+            seq_segs: Vec::new(),
+            qual_segs: Vec::new(),
             resync: false,
-        })
-    }
-
-    #[inline]
-    pub fn next(&mut self) -> Result<Option<FastqRecord<'_>>, FastqError> {
-        let parsed = match self.next_parsed()? {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        Ok(Some(parsed.record))
-    }
-
-    #[inline]
-    pub fn records(&mut self) -> RecordsIter<'_> {
-        RecordsIter {
-            reader: self as *mut FastqReader,
-            _marker: PhantomData,
         }
     }
 
@@ -107,13 +93,44 @@ impl FastqReader {
     }
 
     #[inline]
+    pub fn with_alphabet(mut self, alphabet: Alphabet) -> Self {
+        self.alphabet = alphabet;
+        self
+    }
+
+    #[inline]
     pub fn with_format(mut self, format: FastqFormat) -> Self {
         self.format = format;
         self
     }
+
+    #[inline]
+    pub fn next(&mut self) -> Result<Option<FastqRecord<'_>>, FastqError> {
+        Ok(self.next_parsed()?.map(|p| p.record))
+    }
+
+    pub fn try_for_each<E, F>(&mut self, mut f: F) -> Result<(), TryForEachError<E>>
+    where
+        F: FnMut(FastqRecord<'_>) -> Result<(), E>,
+    {
+        loop {
+            match self.next() {
+                Ok(Some(rec)) => {
+                    if let Err(e) = f(rec) {
+                        return Err(TryForEachError::User(e));
+                    }
+                }
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(TryForEachError::Fastq(e)),
+            }
+        }
+    }
+
     pub(crate) fn next_parsed<'a>(&'a mut self) -> Result<Option<ParsedRecord<'a>>, FastqError> {
         let mode = self.validation;
         let format = self.format;
+        let alphabet = self.alphabet;
+
         if self.resync {
             self.resync = false;
             match &mut self.backend {
@@ -122,208 +139,57 @@ impl FastqReader {
                     resync_plain(buf, &mut self.pos);
                 }
                 Backend::Bgzf(bgzf) => {
-                    resync_bgzf(bgzf)?;
+                    resync_streamed_bgzf(bgzf)?;
                 }
                 Backend::Gzip(_) => {}
             }
         }
+
         let parsed = match (format, &mut self.backend) {
             (FastqFormat::SingleLine, Backend::Plain(mmap)) => {
                 let buf = mmap.slice_from(0);
-                self.parser.next_record(buf, &mut self.pos)
+                self.parser.next_record_in_slice(buf, &mut self.pos)
             }
-            (FastqFormat::SingleLine, Backend::Gzip(gzip)) => self.parser.next_record_gzip(gzip),
-            (FastqFormat::SingleLine, Backend::Bgzf(bgzf)) => self.parser.next_record_bgzf(bgzf),
+            (FastqFormat::SingleLine, Backend::Gzip(gzip)) => {
+                self.parser.next_record_gzip(gzip, &mut self.scratch)
+            }
+            (FastqFormat::SingleLine, Backend::Bgzf(bgzf)) => {
+                self.parser.next_record_bgzf(bgzf, &mut self.scratch)
+            }
             (FastqFormat::MultiLine, Backend::Plain(mmap)) => {
                 let buf = mmap.slice_from(0);
-                self.parser_multi.next_record(
+                self.parser_multi.next_record_in_slice(
                     buf,
                     &mut self.pos,
-                    &mut self.ml_seq_buf,
-                    &mut self.ml_qual_buf,
-                    &mut self.ml_seq_segs,
-                    &mut self.ml_qual_segs,
+                    &mut self.scratch,
+                    &mut self.seq_segs,
+                    &mut self.qual_segs,
                 )
             }
-            (FastqFormat::MultiLine, Backend::Gzip(gzip)) => self.parser_multi.next_record_gzip(
+            (FastqFormat::MultiLine, Backend::Gzip(gzip)) => self.parser_multi.next_record_stream(
                 gzip,
-                &mut self.ml_seq_buf,
-                &mut self.ml_qual_buf,
-                &mut self.ml_seq_segs,
-                &mut self.ml_qual_segs,
+                &mut self.scratch,
+                &mut self.seq_segs,
+                &mut self.qual_segs,
             ),
-            (FastqFormat::MultiLine, Backend::Bgzf(bgzf)) => self.parser_multi.next_record_bgzf(
+            (FastqFormat::MultiLine, Backend::Bgzf(bgzf)) => self.parser_multi.next_record_stream(
                 bgzf,
-                &mut self.ml_seq_buf,
-                &mut self.ml_qual_buf,
-                &mut self.ml_seq_segs,
-                &mut self.ml_qual_segs,
+                &mut self.scratch,
+                &mut self.seq_segs,
+                &mut self.qual_segs,
             ),
         }?;
 
-        let parsed = match parsed {
-            Some(p) => p,
-            None => return Ok(None),
+        let Some(parsed) = parsed else {
+            return Ok(None);
         };
 
         if format == FastqFormat::SingleLine {
-            validate_record(mode, &parsed)?;
+            validate_record_singleline(mode, alphabet, &parsed)?;
         } else {
-            validate_record_multiline(mode, &parsed, &self.ml_seq_segs, &self.ml_qual_segs)?;
+            validate_record_multiline(mode, alphabet, &parsed, &self.seq_segs, &self.qual_segs)?;
         }
         Ok(Some(parsed))
-    }
-}
-
-#[inline]
-fn validate_record(mode: ValidationMode, parsed: &ParsedRecord<'_>) -> Result<(), FastqError> {
-    match mode {
-        ValidationMode::None => Ok(()),
-        ValidationMode::Bases => {
-            if let Err(idx) = validate_bases(parsed.record.seq()) {
-                let b = parsed.record.seq()[idx];
-                return Err(FastqError::InvalidBase {
-                    offset: parsed.seq_start + idx as u64,
-                    byte: b,
-                });
-            }
-            Ok(())
-        }
-        ValidationMode::Qualities => {
-            if let Err(idx) = validate_qual(parsed.record.qual()) {
-                let b = parsed.record.qual()[idx];
-                return Err(FastqError::InvalidQuality {
-                    offset: parsed.qual_start + idx as u64,
-                    byte: b,
-                });
-            }
-            Ok(())
-        }
-        ValidationMode::BasesAndQualities => {
-            if let Err(idx) = validate_bases(parsed.record.seq()) {
-                let b = parsed.record.seq()[idx];
-                return Err(FastqError::InvalidBase {
-                    offset: parsed.seq_start + idx as u64,
-                    byte: b,
-                });
-            }
-            if let Err(idx) = validate_qual(parsed.record.qual()) {
-                let b = parsed.record.qual()[idx];
-                return Err(FastqError::InvalidQuality {
-                    offset: parsed.qual_start + idx as u64,
-                    byte: b,
-                });
-            }
-            Ok(())
-        }
-    }
-}
-
-#[inline]
-fn validate_record_multiline(
-    mode: ValidationMode,
-    parsed: &ParsedRecord<'_>,
-    seq_segs: &[Segment],
-    qual_segs: &[Segment],
-) -> Result<(), FastqError> {
-    match mode {
-        ValidationMode::None => Ok(()),
-        ValidationMode::Bases => {
-            if let Err(idx) = validate_bases(parsed.record.seq()) {
-                let b = parsed.record.seq()[idx];
-                let offset = map_offset(seq_segs, idx, parsed.seq_start);
-                return Err(FastqError::InvalidBase { offset, byte: b });
-            }
-            Ok(())
-        }
-        ValidationMode::Qualities => {
-            if let Err(idx) = validate_qual(parsed.record.qual()) {
-                let b = parsed.record.qual()[idx];
-                let offset = map_offset(qual_segs, idx, parsed.qual_start);
-                return Err(FastqError::InvalidQuality { offset, byte: b });
-            }
-            Ok(())
-        }
-        ValidationMode::BasesAndQualities => {
-            if let Err(idx) = validate_bases(parsed.record.seq()) {
-                let b = parsed.record.seq()[idx];
-                let offset = map_offset(seq_segs, idx, parsed.seq_start);
-                return Err(FastqError::InvalidBase { offset, byte: b });
-            }
-            if let Err(idx) = validate_qual(parsed.record.qual()) {
-                let b = parsed.record.qual()[idx];
-                let offset = map_offset(qual_segs, idx, parsed.qual_start);
-                return Err(FastqError::InvalidQuality { offset, byte: b });
-            }
-            Ok(())
-        }
-    }
-}
-
-#[inline]
-fn map_offset(segs: &[Segment], mut idx: usize, fallback: u64) -> u64 {
-    for seg in segs {
-        if idx < seg.len {
-            return seg.offset + idx as u64;
-        }
-        idx -= seg.len;
-    }
-    fallback + idx as u64
-}
-
-pub struct RecordsIter<'a> {
-    reader: *mut FastqReader,
-    _marker: PhantomData<&'a mut FastqReader>,
-}
-
-impl<'a> Iterator for RecordsIter<'a> {
-    type Item = Result<FastqRecord<'a>, FastqError>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        // SAFETY: RecordsIter owns the exclusive borrow of FastqReader for 'a.
-        let reader = unsafe { &mut *self.reader };
-        match reader.next() {
-            Ok(Some(rec)) => Some(Ok(rec)),
-            Ok(None) => None,
-            Err(err) => Some(Err(err)),
-        }
-    }
-}
-
-#[inline]
-fn is_gz(path: &Path) -> bool {
-    match path.extension() {
-        Some(ext) => ext.eq_ignore_ascii_case("gz"),
-        None => false,
-    }
-}
-
-#[inline]
-fn is_bgzf(path: &Path) -> bool {
-    match path.extension() {
-        Some(ext) => ext.eq_ignore_ascii_case("bgz") || ext.eq_ignore_ascii_case("bgzf"),
-        None => false,
-    }
-}
-
-impl FastqReader {
-    pub fn from_bgzf_path<P: AsRef<Path>>(path: P) -> Result<Self, FastqError> {
-        let path = path.as_ref();
-        let backend = Backend::Bgzf(BgzfBackend::new(path)?);
-        Ok(Self {
-            backend,
-            parser: FastqParser::new(),
-            parser_multi: MultiLineFastqParser::new(),
-            pos: 0,
-            validation: ValidationMode::None,
-            format: FastqFormat::SingleLine,
-            ml_seq_buf: Vec::new(),
-            ml_qual_buf: Vec::new(),
-            ml_seq_segs: Vec::new(),
-            ml_qual_segs: Vec::new(),
-            resync: false,
-        })
     }
 
     pub fn tell(&self) -> VirtualOffset {
@@ -351,23 +217,153 @@ impl FastqReader {
     }
 }
 
+#[derive(Debug)]
+pub enum TryForEachError<E> {
+    Fastq(FastqError),
+    User(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for TryForEachError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fastq(e) => write!(f, "FASTQ error: {e}"),
+            Self::User(e) => write!(f, "user callback error: {e}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for TryForEachError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Fastq(e) => Some(e),
+            Self::User(e) => Some(e),
+        }
+    }
+}
+
 #[inline]
+fn validate_record_singleline(
+    mode: ValidationMode,
+    alphabet: Alphabet,
+    parsed: &ParsedRecord<'_>,
+) -> Result<(), FastqError> {
+    match mode {
+        ValidationMode::None => Ok(()),
+        ValidationMode::Bases => check_bases(parsed, alphabet),
+        ValidationMode::Qualities => check_qual(parsed),
+        ValidationMode::BasesAndQualities => {
+            check_bases(parsed, alphabet)?;
+            check_qual(parsed)
+        }
+    }
+}
+
+#[inline]
+fn check_bases(parsed: &ParsedRecord<'_>, alphabet: Alphabet) -> Result<(), FastqError> {
+    if let Err(idx) = validate_bases_with(parsed.record.seq(), alphabet) {
+        let b = parsed.record.seq()[idx];
+        return Err(FastqError::InvalidBase {
+            offset: parsed.seq_start + idx as u64,
+            byte: b,
+        });
+    }
+    Ok(())
+}
+
+#[inline]
+fn check_qual(parsed: &ParsedRecord<'_>) -> Result<(), FastqError> {
+    if let Err(idx) = validate_qual(parsed.record.qual()) {
+        let b = parsed.record.qual()[idx];
+        return Err(FastqError::InvalidQuality {
+            offset: parsed.qual_start + idx as u64,
+            byte: b,
+        });
+    }
+    Ok(())
+}
+
+#[inline]
+fn validate_record_multiline(
+    mode: ValidationMode,
+    alphabet: Alphabet,
+    parsed: &ParsedRecord<'_>,
+    seq_segs: &[Segment],
+    qual_segs: &[Segment],
+) -> Result<(), FastqError> {
+    match mode {
+        ValidationMode::None => Ok(()),
+        ValidationMode::Bases => check_bases_ml(parsed, alphabet, seq_segs),
+        ValidationMode::Qualities => check_qual_ml(parsed, qual_segs),
+        ValidationMode::BasesAndQualities => {
+            check_bases_ml(parsed, alphabet, seq_segs)?;
+            check_qual_ml(parsed, qual_segs)
+        }
+    }
+}
+
+#[inline]
+fn check_bases_ml(
+    parsed: &ParsedRecord<'_>,
+    alphabet: Alphabet,
+    segs: &[Segment],
+) -> Result<(), FastqError> {
+    if let Err(idx) = validate_bases_with(parsed.record.seq(), alphabet) {
+        let b = parsed.record.seq()[idx];
+        let offset = map_offset(segs, idx, parsed.seq_start);
+        return Err(FastqError::InvalidBase { offset, byte: b });
+    }
+    Ok(())
+}
+
+#[inline]
+fn check_qual_ml(parsed: &ParsedRecord<'_>, segs: &[Segment]) -> Result<(), FastqError> {
+    if let Err(idx) = validate_qual(parsed.record.qual()) {
+        let b = parsed.record.qual()[idx];
+        let offset = map_offset(segs, idx, parsed.qual_start);
+        return Err(FastqError::InvalidQuality { offset, byte: b });
+    }
+    Ok(())
+}
+
+#[inline]
+fn map_offset(segs: &[Segment], mut idx: usize, fallback: u64) -> u64 {
+    for seg in segs {
+        if idx < seg.len {
+            return seg.offset + idx as u64;
+        }
+        idx -= seg.len;
+    }
+    fallback + idx as u64
+}
+
+#[inline]
+fn is_gz(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
+}
+
+#[inline]
+fn is_bgzf(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bgz") || ext.eq_ignore_ascii_case("bgzf"))
+}
+
+// Quartet anchoring (`@…\n…\n+…\n…\n`) avoids the classic FASTQ resync pitfall
+// where a quality line legitimately starts with `@`.
 fn resync_plain(buf: &[u8], pos: &mut usize) {
     let mut p = *pos;
-    if p == 0 && p < buf.len() && buf[p] == b'@' {
-        *pos = p;
-        return;
+    if p > buf.len() {
+        p = buf.len();
     }
     loop {
         if p >= buf.len() {
             *pos = p;
             return;
         }
-        if p == 0 || buf[p - 1] == b'\n' {
-            if buf[p] == b'@' {
-                *pos = p;
-                return;
-            }
+        let at_line_start = p == 0 || buf[p - 1] == b'\n';
+        if at_line_start && buf[p] == b'@' && looks_like_record_start(buf, p) {
+            *pos = p;
+            return;
         }
         match find_lf(buf, p) {
             Some(lf) => p = lf + 1,
@@ -379,29 +375,63 @@ fn resync_plain(buf: &[u8], pos: &mut usize) {
     }
 }
 
-fn resync_bgzf(bgzf: &mut BgzfBackend) -> Result<(), FastqError> {
+fn looks_like_record_start(buf: &[u8], p: usize) -> bool {
+    let mut cursor = p;
+    let lf1 = match find_lf(buf, cursor) {
+        Some(v) => v,
+        None => return false,
+    };
+    cursor = lf1 + 1;
+    let lf2 = match find_lf(buf, cursor) {
+        Some(v) => v,
+        None => return false,
+    };
+    let seq_len = lf2.saturating_sub(cursor);
+    let seq_len = if seq_len > 0 && buf[lf2 - 1] == b'\r' {
+        seq_len - 1
+    } else {
+        seq_len
+    };
+    cursor = lf2 + 1;
+    if cursor >= buf.len() || buf[cursor] != b'+' {
+        return false;
+    }
+    let lf3 = match find_lf(buf, cursor) {
+        Some(v) => v,
+        None => return false,
+    };
+    cursor = lf3 + 1;
+    let lf4 = match find_lf(buf, cursor) {
+        Some(v) => v,
+        None => return false,
+    };
+    let qual_len = lf4.saturating_sub(cursor);
+    let qual_len = if qual_len > 0 && buf[lf4 - 1] == b'\r' {
+        qual_len - 1
+    } else {
+        qual_len
+    };
+    seq_len == qual_len && seq_len > 0
+}
+
+// Streaming BGZF cannot afford the multi-line quartet lookahead; this matches htslib semantics.
+fn resync_streamed_bgzf(bgzf: &mut BgzfBackend) -> Result<(), FastqError> {
+    let mut buf = Vec::new();
     loop {
-        let slice = bgzf.available_slice();
-        if slice.is_empty() {
-            if !bgzf.refill()? {
-                return Ok(());
+        match bgzf.peek_byte()? {
+            Some(b'@') => return Ok(()),
+            Some(_) => {
+                buf.clear();
+                let status = bgzf.read_line(&mut buf)?;
+                if matches!(
+                    status,
+                    crate::backend::gzip::LineStatus::EofClean
+                        | crate::backend::gzip::LineStatus::EofPartial
+                ) {
+                    return Ok(());
+                }
             }
-            continue;
-        }
-        if (bgzf.logical_offset() == 0 || slice[0] == b'@') && slice[0] == b'@' {
-            return Ok(());
-        }
-        if let Some(lf) = find_lf(slice, 0) {
-            let next_pos = lf + 1;
-            bgzf.advance(next_pos);
-            let next = bgzf.available_slice();
-            if !next.is_empty() && next[0] == b'@' {
-                return Ok(());
-            }
-            continue;
-        } else {
-            let len = slice.len();
-            bgzf.advance(len);
+            None => return Ok(()),
         }
     }
 }
@@ -413,7 +443,7 @@ enum CompressionKind {
     Bgzf,
 }
 
-fn detect_compression(path: &Path) -> Result<CompressionKind, std::io::Error> {
+fn detect_compression(path: &Path) -> Result<CompressionKind, FastqError> {
     let mut file = File::open(path)?;
     let mut buf = [0u8; 128];
     let n = file.read(&mut buf)?;
@@ -423,29 +453,32 @@ fn detect_compression(path: &Path) -> Result<CompressionKind, std::io::Error> {
     if buf[0] != 0x1f || buf[1] != 0x8b {
         return Ok(CompressionKind::Plain);
     }
-    if n < 10 {
+    if n < 12 {
         return Ok(CompressionKind::Gzip);
     }
     let flg = buf[3];
     if (flg & 0x04) == 0 {
         return Ok(CompressionKind::Gzip);
     }
-    if n < 12 {
-        return Ok(CompressionKind::Gzip);
-    }
     let xlen = u16::from_le_bytes([buf[10], buf[11]]) as usize;
-    let extra_end = 12 + xlen;
+    let extra_end = 12usize.saturating_add(xlen);
     if extra_end > n {
         return Ok(CompressionKind::Gzip);
     }
-    let extra = &buf[12..extra_end];
-    for i in memchr_iter(b'B', extra) {
-        if i + 3 < extra.len() && extra[i + 1] == b'C' {
-            let slen = u16::from_le_bytes([extra[i + 2], extra[i + 3]]) as usize;
-            if slen == 2 {
-                return Ok(CompressionKind::Bgzf);
-            }
+    let mut i = 12;
+    while i + 4 <= extra_end {
+        let si1 = buf[i];
+        let si2 = buf[i + 1];
+        let slen = u16::from_le_bytes([buf[i + 2], buf[i + 3]]) as usize;
+        i += 4;
+        let sub_end = i.saturating_add(slen);
+        if sub_end > extra_end {
+            break;
         }
+        if si1 == b'B' && si2 == b'C' && slen == 2 {
+            return Ok(CompressionKind::Bgzf);
+        }
+        i = sub_end;
     }
     Ok(CompressionKind::Gzip)
 }
