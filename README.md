@@ -190,4 +190,4 @@ fn main() -> Result<(), kira_fastq::FastqError> {
 
 ## MSRV
 
-Rust **1.91+** (2024 edition). MSRV bumps only in minor or major releases.
+Rust **1.95+** (2024 edition). MSRV bumps only in minor or major releases.
