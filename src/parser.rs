@@ -1,6 +1,6 @@
-use crate::backend::bgzf::BgzfBackend;
-use crate::backend::gzip::{GzipBackend, LineStatus};
+use crate::backend::gzip::LineStatus;
 use crate::error::{FastqError, InvalidKind};
+use crate::multiline::LineSource;
 use crate::record::FastqRecord;
 use crate::simd::newline::find_lf;
 
@@ -48,6 +48,7 @@ impl FastqParser {
         Self
     }
 
+    /// Zero-copy single-line parse over a contiguous slice (mmap, in-memory buffer).
     pub fn next_record_in_slice<'a>(
         &mut self,
         buf: &'a [u8],
@@ -123,75 +124,11 @@ impl FastqParser {
         }))
     }
 
-    pub fn next_record_gzip<'a>(
+    /// Generic single-line parser over any [`LineSource`] (Gzip, Bgzf, Stream, or the
+    /// `noodles-bgzf` adapter when enabled). Records borrow into `scratch`.
+    pub fn next_record_stream<'a, B: LineSource>(
         &mut self,
-        backend: &mut GzipBackend,
-        scratch: &'a mut RecordScratch,
-    ) -> Result<Option<ParsedRecord<'a>>, FastqError> {
-        let header_start = backend.logical_offset();
-        match backend.read_line(&mut scratch.header)? {
-            LineStatus::Line => {}
-            LineStatus::EofClean => return Ok(None),
-            LineStatus::EofPartial => {
-                return Err(FastqError::UnexpectedEof {
-                    offset: header_start,
-                });
-            }
-        }
-        if scratch.header.is_empty() || scratch.header[0] != b'@' {
-            return Err(FastqError::InvalidFormat {
-                offset: header_start,
-                kind: InvalidKind::HeaderMissingAt,
-            });
-        }
-        scratch.header.drain(..1);
-
-        let seq_start = backend.logical_offset();
-        if backend.read_line(&mut scratch.seq)? != LineStatus::Line {
-            return Err(FastqError::UnexpectedEof { offset: seq_start });
-        }
-        if scratch.seq.is_empty() {
-            return Err(FastqError::InvalidFormat {
-                offset: seq_start,
-                kind: InvalidKind::SeqLineEmpty,
-            });
-        }
-
-        let plus_start = backend.logical_offset();
-        if backend.read_line(&mut scratch.plus)? != LineStatus::Line {
-            return Err(FastqError::UnexpectedEof { offset: plus_start });
-        }
-        if scratch.plus.is_empty() || scratch.plus[0] != b'+' {
-            return Err(FastqError::InvalidFormat {
-                offset: plus_start,
-                kind: InvalidKind::PlusMissing,
-            });
-        }
-
-        let qual_start = backend.logical_offset();
-        if backend.read_line(&mut scratch.qual)? != LineStatus::Line {
-            return Err(FastqError::UnexpectedEof { offset: qual_start });
-        }
-
-        if scratch.seq.len() != scratch.qual.len() {
-            return Err(FastqError::LengthMismatch {
-                offset: qual_start,
-                seq_len: scratch.seq.len(),
-                qual_len: scratch.qual.len(),
-            });
-        }
-
-        Ok(Some(ParsedRecord {
-            record: FastqRecord::new(&scratch.header, &scratch.seq, &scratch.qual),
-            header_start,
-            seq_start,
-            qual_start,
-        }))
-    }
-
-    pub fn next_record_bgzf<'a>(
-        &mut self,
-        backend: &mut BgzfBackend,
+        backend: &mut B,
         scratch: &'a mut RecordScratch,
     ) -> Result<Option<ParsedRecord<'a>>, FastqError> {
         let header_start = backend.logical_offset();

@@ -1,7 +1,7 @@
 [package]
 name = "kira-fastq"
-description = "High-performance FASTQ reader with mmap-first design. Supports plain, gzip, and BGZF inputs; optional multi-line parsing; and explicit paired-end reading."
-version = "0.2.0"
+description = "High-performance FASTQ reader and writer with mmap-first design. Supports plain, gzip, and BGZF inputs/outputs; optional multi-line parsing; explicit paired-end reading; sync and async APIs; optional `noodles-bgzf` interop."
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -23,17 +23,29 @@ memmap2 = "0.9"
 miniz_oxide = "0.9"
 memchr = "2.7"
 crc32fast = "1.5"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+
 libdeflater = { version = "1.23", optional = true }
+
+tokio = { version = "1", optional = true, default-features = false, features = ["io-util", "fs", "rt"] }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
+async-compression = { version = "0.4", optional = true, default-features = false, features = ["tokio", "gzip"] }
+
+noodles-bgzf = { version = "0.47", optional = true }
 
 [dev-dependencies]
 criterion = "0.8"
 flate2 = "1.1"
 crc32fast = "1.5"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "fs"] }
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 
 [features]
 default = []
 gzip-validate = []
 libdeflate = ["dep:libdeflater"]
+async = ["dep:tokio", "dep:futures-util", "dep:async-compression"]
+noodles-bgzf = ["dep:noodles-bgzf"]
 
 [[bench]]
 name = "newline"

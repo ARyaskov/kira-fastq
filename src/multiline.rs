@@ -1,9 +1,13 @@
 use crate::backend::bgzf::BgzfBackend;
 use crate::backend::gzip::{GzipBackend, LineStatus};
+use crate::backend::stream::StreamBackend;
 use crate::error::{FastqError, InvalidKind};
 use crate::parser::{ParsedRecord, RecordScratch, Segment};
 use crate::record::FastqRecord;
 use crate::simd::newline::find_lf;
+
+#[cfg(feature = "noodles-bgzf")]
+use crate::backend::noodles_bgzf::NoodlesBgzfBackend;
 
 pub trait LineSource {
     fn read_line(&mut self, out: &mut Vec<u8>) -> Result<LineStatus, FastqError>;
@@ -29,6 +33,29 @@ impl LineSource for BgzfBackend {
     #[inline]
     fn logical_offset(&self) -> u64 {
         BgzfBackend::logical_offset(self)
+    }
+}
+
+impl LineSource for StreamBackend {
+    #[inline]
+    fn read_line(&mut self, out: &mut Vec<u8>) -> Result<LineStatus, FastqError> {
+        StreamBackend::read_line(self, out)
+    }
+    #[inline]
+    fn logical_offset(&self) -> u64 {
+        StreamBackend::logical_offset(self)
+    }
+}
+
+#[cfg(feature = "noodles-bgzf")]
+impl LineSource for NoodlesBgzfBackend {
+    #[inline]
+    fn read_line(&mut self, out: &mut Vec<u8>) -> Result<LineStatus, FastqError> {
+        NoodlesBgzfBackend::read_line(self, out)
+    }
+    #[inline]
+    fn logical_offset(&self) -> u64 {
+        NoodlesBgzfBackend::logical_offset(self)
     }
 }
 

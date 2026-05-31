@@ -1,11 +1,12 @@
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use crate::backend::Backend;
 use crate::backend::bgzf::BgzfBackend;
 use crate::backend::gzip::GzipBackend;
 use crate::backend::mmap::MmapBackend;
+use crate::backend::stream::StreamBackend;
 use crate::error::FastqError;
 use crate::error::UnsupportedOperation;
 use crate::format::FastqFormat;
@@ -17,6 +18,9 @@ use crate::simd::bases::validate_bases_with;
 use crate::simd::newline::find_lf;
 use crate::simd::qual::validate_qual;
 use crate::validation::{Alphabet, ValidationMode};
+
+#[cfg(feature = "noodles-bgzf")]
+use crate::backend::noodles_bgzf::NoodlesBgzfBackend;
 
 pub struct FastqReader {
     backend: Backend,
@@ -33,7 +37,7 @@ pub struct FastqReader {
 }
 
 impl FastqReader {
-    /// Backend is chosen from the file extension.
+    /// Backend is chosen from the file extension. mmap-first for plain inputs.
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, FastqError> {
         let path = path.as_ref();
         let backend = if is_bgzf(path) {
@@ -68,6 +72,31 @@ impl FastqReader {
         Ok(Self::with_backend(Backend::Bgzf(BgzfBackend::new(
             path.as_ref(),
         )?)))
+    }
+
+    /// Read from any [`BufRead`] source (stdin, sockets, in-memory buffers, custom
+    /// decoders). **No mmap** on this path — every record's lines are copied into the
+    /// reader's scratch buffer. SIMD validation, multi-line, and validation modes still
+    /// apply.
+    ///
+    /// Use this when the source is not a file (or is a non-seekable file).
+    pub fn from_reader<R: BufRead + Send + 'static>(reader: R) -> Self {
+        Self::with_backend(Backend::Stream(StreamBackend::new(Box::new(reader))))
+    }
+
+    /// Convenience: wraps a [`std::io::Read`] in a [`BufReader`] and delegates to
+    /// [`Self::from_reader`].
+    pub fn from_unbuffered<R: Read + Send + 'static>(reader: R) -> Self {
+        Self::from_reader(BufReader::with_capacity(256 * 1024, reader))
+    }
+
+    /// Open via the optional `noodles-bgzf` adapter. Use this when downstream code expects
+    /// the same BGZF virtual-offset semantics as the rest of the noodles ecosystem.
+    #[cfg(feature = "noodles-bgzf")]
+    pub fn from_noodles_bgzf_path<P: AsRef<Path>>(path: P) -> Result<Self, FastqError> {
+        Ok(Self::with_backend(Backend::NoodlesBgzf(
+            NoodlesBgzfBackend::open(path.as_ref())?,
+        )))
     }
 
     fn with_backend(backend: Backend) -> Self {
@@ -142,6 +171,9 @@ impl FastqReader {
                     resync_streamed_bgzf(bgzf)?;
                 }
                 Backend::Gzip(_) => {}
+                Backend::Stream(_) => {}
+                #[cfg(feature = "noodles-bgzf")]
+                Backend::NoodlesBgzf(_) => {}
             }
         }
 
@@ -151,10 +183,17 @@ impl FastqReader {
                 self.parser.next_record_in_slice(buf, &mut self.pos)
             }
             (FastqFormat::SingleLine, Backend::Gzip(gzip)) => {
-                self.parser.next_record_gzip(gzip, &mut self.scratch)
+                self.parser.next_record_stream(gzip, &mut self.scratch)
             }
             (FastqFormat::SingleLine, Backend::Bgzf(bgzf)) => {
-                self.parser.next_record_bgzf(bgzf, &mut self.scratch)
+                self.parser.next_record_stream(bgzf, &mut self.scratch)
+            }
+            (FastqFormat::SingleLine, Backend::Stream(s)) => {
+                self.parser.next_record_stream(s, &mut self.scratch)
+            }
+            #[cfg(feature = "noodles-bgzf")]
+            (FastqFormat::SingleLine, Backend::NoodlesBgzf(b)) => {
+                self.parser.next_record_stream(b, &mut self.scratch)
             }
             (FastqFormat::MultiLine, Backend::Plain(mmap)) => {
                 let buf = mmap.slice_from(0);
@@ -178,6 +217,16 @@ impl FastqReader {
                 &mut self.seq_segs,
                 &mut self.qual_segs,
             ),
+            (FastqFormat::MultiLine, Backend::Stream(s)) => self.parser_multi.next_record_stream(
+                s,
+                &mut self.scratch,
+                &mut self.seq_segs,
+                &mut self.qual_segs,
+            ),
+            #[cfg(feature = "noodles-bgzf")]
+            (FastqFormat::MultiLine, Backend::NoodlesBgzf(b)) => self
+                .parser_multi
+                .next_record_stream(b, &mut self.scratch, &mut self.seq_segs, &mut self.qual_segs),
         }?;
 
         let Some(parsed) = parsed else {
@@ -197,6 +246,9 @@ impl FastqReader {
             Backend::Plain(_) => VirtualOffset(self.pos as u64),
             Backend::Gzip(gz) => VirtualOffset(gz.logical_offset()),
             Backend::Bgzf(bgzf) => bgzf.tell(),
+            Backend::Stream(s) => VirtualOffset(s.logical_offset()),
+            #[cfg(feature = "noodles-bgzf")]
+            Backend::NoodlesBgzf(b) => VirtualOffset(b.logical_offset()),
         }
     }
 
@@ -213,6 +265,9 @@ impl FastqReader {
                 Ok(())
             }
             Backend::Gzip(_) => Err(FastqError::Unsupported(UnsupportedOperation::Seek)),
+            Backend::Stream(_) => Err(FastqError::Unsupported(UnsupportedOperation::Seek)),
+            #[cfg(feature = "noodles-bgzf")]
+            Backend::NoodlesBgzf(_) => Err(FastqError::Unsupported(UnsupportedOperation::Seek)),
         }
     }
 }
