@@ -50,7 +50,7 @@ fn paired_length_mismatch_r2_shorter() {
     let _ = pe.next().expect("read").expect("pair1");
     let err = pe.next().expect_err("should error");
     match err {
-        FastqError::PairedLengthMismatch { which } => {
+        FastqError::PairedCountMismatch { which, .. } => {
             assert_eq!(which, PairedWhich::R2);
         }
         other => panic!("unexpected error: {other:?}"),
@@ -68,7 +68,7 @@ fn paired_length_mismatch_r1_shorter() {
     let _ = pe.next().expect("read").expect("pair1");
     let err = pe.next().expect_err("should error");
     match err {
-        FastqError::PairedLengthMismatch { which } => {
+        FastqError::PairedCountMismatch { which, .. } => {
             assert_eq!(which, PairedWhich::R1);
         }
         other => panic!("unexpected error: {other:?}"),

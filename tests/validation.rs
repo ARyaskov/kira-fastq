@@ -64,7 +64,7 @@ fn bases_validation_invalid_positions_plain() {
             .with_alphabet(Alphabet::AcgtnStrict);
         let err = reader.next().expect_err("should error");
         match err {
-            FastqError::InvalidBase { offset, byte } => {
+            FastqError::InvalidBase { offset, byte, .. } => {
                 assert_eq!(byte, data[(seq_start(data) as usize) + bad_idx]);
                 assert_eq!(offset, seq_start(data) + bad_idx as u64);
             }
@@ -83,7 +83,7 @@ fn qualities_validation_invalid_plain() {
         .with_validation(ValidationMode::Qualities);
     let err = reader.next().expect_err("should error");
     match err {
-        FastqError::InvalidQuality { offset, byte } => {
+        FastqError::InvalidQuality { offset, byte, .. } => {
             assert_eq!(byte, 0x10);
             assert_eq!(offset, qual_start(data) + 3);
         }
@@ -116,7 +116,7 @@ fn bases_validation_gzip_invalid() {
         .with_alphabet(Alphabet::AcgtnStrict);
     let err = reader.next().expect_err("should error");
     match err {
-        FastqError::InvalidBase { offset, byte } => {
+        FastqError::InvalidBase { offset, byte, .. } => {
             assert_eq!(byte, b'X');
             assert_eq!(offset, seq_start(data) + 4);
         }

@@ -16,8 +16,10 @@
 /// Uses [`Vec::extend_from_slice`] which lowers to `memcpy`; no per-byte writes.
 #[inline]
 pub fn assemble_record(out: &mut Vec<u8>, header: &[u8], seq: &[u8], qual: &[u8]) {
-    // Layout: '@' + header + '\n' + seq + '\n' + '+' + '\n' + qual + '\n'
-    let total = 1 + header.len() + 1 + seq.len() + 2 + qual.len() + 1;
+    // Layout: '@' + header + '\n' + seq + '\n' + '+' + '\n' + qual + '\n', so six bytes of
+    // framing. Getting this count wrong costs a reallocation every time a record sets a new
+    // high-water mark.
+    let total = header.len() + seq.len() + qual.len() + 6;
     out.clear();
     out.reserve(total);
     out.push(b'@');

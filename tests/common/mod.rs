@@ -38,6 +38,15 @@ pub fn write_multi_member_gzip(path: &PathBuf, parts: &[&[u8]]) {
     std::fs::write(path, out).expect("write multi-member gzip");
 }
 
+/// Write BGZF without the trailing end-of-file marker, i.e. what a truncated or unfinished
+/// file looks like.
+pub fn write_bgzf_without_eof(path: &PathBuf, data: &[u8], split: usize) {
+    write_bgzf(path, data, split);
+    let mut bytes = std::fs::read(path).expect("read back");
+    bytes.truncate(bytes.len() - 28);
+    std::fs::write(path, bytes).expect("rewrite");
+}
+
 pub fn write_bgzf(path: &PathBuf, data: &[u8], split: usize) {
     let mut out = Vec::new();
     let mut pos = 0usize;

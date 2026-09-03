@@ -1,28 +1,31 @@
-//! Async FASTQ reader and writer (`tokio`-based).
+//! Async FASTQ reader and writer, on tokio.
 //!
-//! **No mmap on this path.** mmap is inherently synchronous; async I/O implies streaming
-//! reads/writes via `tokio::io`. The zero-copy borrowed-record API survives (records borrow
-//! into the reader's scratch buffer), but the underlying source/sink goes through tokio's
-//! syscall-backed I/O. Expect ~10–30 % lower throughput than the sync mmap path for plain
-//! files; gzip/BGZF are typically I/O-bound and the difference shrinks to near zero.
+//! There is no memory mapping here: mapping is synchronous by nature, so async I/O goes through
+//! `tokio::io`. Records still borrow out of the reader's scratch buffer, so per-record parsing
+//! allocates nothing.
+//!
+//! **Reach for the sync API first.** It is faster and simpler for a tool that reads a file and
+//! exits. Use this when a tokio runtime is already in the picture: long-lived servers,
+//! backpressure-aware pipelines, integration with axum, tonic or sqlx.
 //!
 //! ## Reader
 //!
-//! - [`AsyncFastqReader::from_reader`] — any `R: AsyncBufRead + Unpin + Send`.
-//! - [`AsyncFastqReader::from_path`] — `tokio::fs::File`, with auto-detect of gzip
-//!   compression via the file's magic bytes (BGZF is treated as gzip in async mode; for
-//!   true BGZF semantics use the sync path or a `noodles_bgzf::AsyncReader` wrapped via
-//!   `from_reader`).
-//! - [`AsyncFastqReader::next`] — borrowed record (`FastqRecord<'_>`).
-//! - [`AsyncFastqReader::records`] — owned-record [`Stream`].
+//! - [`AsyncFastqReader::from_reader`] over any `AsyncBufRead`.
+//! - [`AnyAsyncReader::from_path`] for a file, with gzip detected from the magic bytes and
+//!   multi-member streams decoded in full.
+//! - [`AsyncFastqReader::next`] yields a borrowed record; it is **not** cancel-safe, see the
+//!   type's documentation.
+//! - [`AsyncFastqReader::records`] turns the reader into a stream of owned records.
 //!
 //! ## Writer
 //!
-//! - [`AsyncFastqWriter::from_writer`] — any `W: AsyncWrite + Unpin + Send`.
-//! - [`AsyncFastqWriter::from_path`] — `tokio::fs::File`, with `.gz` triggering streaming
-//!   gzip via `async-compression`.
-//! - Single `write_all().await` per record via the same assemble-into-scratch trick as
-//!   the sync writer.
+//! - [`AsyncFastqWriter::from_writer`] over any `AsyncWrite`, [`AsyncFastqWriter::from_path`]
+//!   for a file with `.gz` support.
+//! - One `write_all` per record, as on the sync side.
+//! - [`AsyncFastqWriter::shutdown`] writes the gzip trailer; call it before dropping.
+//!
+//! BGZF and zstd output are sync-only. For BGZF input with real virtual offsets, use the sync
+//! reader or wrap a `noodles_bgzf` async reader with [`AsyncFastqReader::from_reader`].
 
 mod reader;
 mod writer;

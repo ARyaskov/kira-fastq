@@ -10,7 +10,7 @@ fn bad_header() {
     let mut reader = FastqReader::from_path(path).expect("open");
     let err = reader.next().expect_err("should error");
     match err {
-        FastqError::InvalidFormat { offset, kind } => {
+        FastqError::InvalidFormat { offset, kind, .. } => {
             assert_eq!(offset, 0);
             assert_eq!(kind, InvalidKind::HeaderMissingAt);
         }
@@ -26,7 +26,7 @@ fn bad_plus() {
     let data = std::fs::read(path).expect("read");
     let plus_offset = data.iter().position(|&b| b == b'x').unwrap() as u64;
     match err {
-        FastqError::InvalidFormat { offset, kind } => {
+        FastqError::InvalidFormat { offset, kind, .. } => {
             assert_eq!(offset, plus_offset);
             assert_eq!(kind, InvalidKind::PlusMissing);
         }
@@ -56,6 +56,7 @@ fn length_mismatch() {
             offset,
             seq_len,
             qual_len,
+            ..
         } => {
             assert_eq!(offset, qual_offset);
             assert_eq!(seq_len, 4);
@@ -72,7 +73,7 @@ fn bad_header_gzip() {
     let mut reader = FastqReader::from_path(&path).expect("open");
     let err = reader.next().expect_err("should error");
     match err {
-        FastqError::InvalidFormat { offset, kind } => {
+        FastqError::InvalidFormat { offset, kind, .. } => {
             assert_eq!(offset, 0);
             assert_eq!(kind, InvalidKind::HeaderMissingAt);
         }
@@ -87,7 +88,7 @@ fn bad_plus_gzip() {
     let mut reader = FastqReader::from_path(&path).expect("open");
     let err = reader.next().expect_err("should error");
     match err {
-        FastqError::InvalidFormat { offset, kind } => {
+        FastqError::InvalidFormat { offset, kind, .. } => {
             assert_eq!(offset, 9);
             assert_eq!(kind, InvalidKind::PlusMissing);
         }
@@ -106,36 +107,11 @@ fn length_mismatch_gzip() {
             offset,
             seq_len,
             qual_len,
+            ..
         } => {
             assert_eq!(offset, 11);
             assert_eq!(seq_len, 4);
             assert_eq!(qual_len, 3);
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
-}
-
-#[cfg(feature = "gzip-validate")]
-#[test]
-fn gzip_trailer_crc_mismatch() {
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
-    use std::io::Write;
-
-    let path = common::unique_path("bad_crc.fastq.gz");
-    let data = b"@r1\nACGT\n+\n!!!!\n";
-    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(data).expect("write");
-    let mut gz = enc.finish().expect("finish");
-    let len = gz.len();
-    gz[len - 8] ^= 0xFF;
-    std::fs::write(&path, gz).expect("write");
-
-    let mut reader = FastqReader::from_path(&path).expect("open");
-    let err = reader.next().expect_err("should error");
-    match err {
-        FastqError::InvalidFormat { kind, .. } => {
-            assert_eq!(kind, InvalidKind::GzipTrailerCrc);
         }
         other => panic!("unexpected error: {other:?}"),
     }

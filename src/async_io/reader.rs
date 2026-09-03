@@ -6,17 +6,27 @@ use futures_util::stream::{Stream, try_unfold};
 use tokio::fs::File;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::backend::gzip::LineStatus;
-use crate::error::{FastqError, InvalidKind};
+use crate::backend::LineStatus;
+use crate::error::{FastqError, InvalidKind, UnsupportedOperation};
 use crate::format::FastqFormat;
 use crate::parser::{RecordScratch, Segment};
 use crate::record::{FastqRecord, FastqRecordOwned};
 use crate::simd::bases::validate_bases_with;
-use crate::simd::qual::validate_qual;
-use crate::validation::{Alphabet, ValidationMode};
+use crate::simd::qual::validate_qual_encoding;
+use crate::validation::{Alphabet, QualityEncoding, ValidationMode};
 
-/// Async FASTQ reader over any `AsyncBufRead`. See [`crate::async_io`] module docs for the
-/// performance contract.
+/// Async FASTQ reader over any `AsyncBufRead`.
+///
+/// Accepts the same deviations as the sync reader: a missing final newline, blank lines between
+/// records, zero-length reads, and CRLF.
+///
+/// # Cancellation
+///
+/// [`AsyncFastqReader::next`] is **not** cancel-safe. A record spans four reads of the
+/// underlying stream, so dropping the future partway leaves the reader between lines and the
+/// next call will misparse. Do not call it in a `tokio::select!` branch that can lose the race;
+/// drive the reader from one task, and use [`AsyncFastqReader::records`] with a channel if other
+/// tasks need the records.
 pub struct AsyncFastqReader<R: AsyncBufRead + Unpin + Send> {
     inner: R,
     scratch: RecordScratch,
@@ -24,8 +34,10 @@ pub struct AsyncFastqReader<R: AsyncBufRead + Unpin + Send> {
     qual_segs: Vec<Segment>,
     validation: ValidationMode,
     alphabet: Alphabet,
+    quality: QualityEncoding,
     format: FastqFormat,
     logical_offset: u64,
+    records: u64,
 }
 
 impl<R: AsyncBufRead + Unpin + Send> AsyncFastqReader<R> {
@@ -38,8 +50,10 @@ impl<R: AsyncBufRead + Unpin + Send> AsyncFastqReader<R> {
             qual_segs: Vec::new(),
             validation: ValidationMode::None,
             alphabet: Alphabet::default(),
+            quality: QualityEncoding::default(),
             format: FastqFormat::default(),
             logical_offset: 0,
+            records: 0,
         }
     }
 
@@ -56,96 +70,42 @@ impl<R: AsyncBufRead + Unpin + Send> AsyncFastqReader<R> {
     }
 
     #[inline]
+    pub fn with_quality_encoding(mut self, encoding: QualityEncoding) -> Self {
+        self.quality = encoding;
+        self
+    }
+
+    #[inline]
     pub fn with_format(mut self, format: FastqFormat) -> Self {
         self.format = format;
         self
     }
 
-    /// Logical byte offset of the next-to-be-read line, counting decoded bytes.
+    /// Logical byte offset of the next line, counting decoded bytes.
     #[inline]
     pub fn logical_offset(&self) -> u64 {
         self.logical_offset
     }
 
-    /// Read the next record. Borrowed into the reader's scratch buffer — the borrow is
-    /// invalidated on the next call.
-    pub async fn next(&mut self) -> Result<Option<FastqRecord<'_>>, FastqError> {
-        match self.format {
-            FastqFormat::SingleLine => self.next_single().await,
-            FastqFormat::MultiLine => self.next_multi().await,
-        }
+    /// Number of records returned so far.
+    #[inline]
+    pub fn records_read(&self) -> u64 {
+        self.records
     }
 
-    async fn next_single(&mut self) -> Result<Option<FastqRecord<'_>>, FastqError> {
-        let header_start = self.logical_offset;
-        match read_line(&mut self.inner, &mut self.scratch.header, &mut self.logical_offset).await?
-        {
-            LineStatus::Line => {}
-            LineStatus::EofClean => return Ok(None),
-            LineStatus::EofPartial => {
-                return Err(FastqError::UnexpectedEof {
-                    offset: header_start,
-                });
-            }
+    /// Read the next record, borrowed from the reader's scratch. The borrow ends at the next
+    /// call. Not cancel-safe; see the type's documentation.
+    pub async fn next(&mut self) -> Result<Option<FastqRecord<'_>>, FastqError> {
+        let record_index = self.records + 1;
+        let found = match self.format {
+            FastqFormat::SingleLine => self.next_single(record_index).await,
+            FastqFormat::MultiLine => self.next_multi(record_index).await,
         }
-        if self.scratch.header.is_empty() || self.scratch.header[0] != b'@' {
-            return Err(FastqError::InvalidFormat {
-                offset: header_start,
-                kind: InvalidKind::HeaderMissingAt,
-            });
+        .map_err(|e| e.with_record(record_index))?;
+        if !found {
+            return Ok(None);
         }
-        self.scratch.header.drain(..1);
-
-        let seq_start = self.logical_offset;
-        if read_line(&mut self.inner, &mut self.scratch.seq, &mut self.logical_offset).await?
-            != LineStatus::Line
-        {
-            return Err(FastqError::UnexpectedEof { offset: seq_start });
-        }
-        if self.scratch.seq.is_empty() {
-            return Err(FastqError::InvalidFormat {
-                offset: seq_start,
-                kind: InvalidKind::SeqLineEmpty,
-            });
-        }
-
-        let plus_start = self.logical_offset;
-        if read_line(&mut self.inner, &mut self.scratch.plus, &mut self.logical_offset).await?
-            != LineStatus::Line
-        {
-            return Err(FastqError::UnexpectedEof { offset: plus_start });
-        }
-        if self.scratch.plus.is_empty() || self.scratch.plus[0] != b'+' {
-            return Err(FastqError::InvalidFormat {
-                offset: plus_start,
-                kind: InvalidKind::PlusMissing,
-            });
-        }
-
-        let qual_start = self.logical_offset;
-        if read_line(&mut self.inner, &mut self.scratch.qual, &mut self.logical_offset).await?
-            != LineStatus::Line
-        {
-            return Err(FastqError::UnexpectedEof { offset: qual_start });
-        }
-
-        if self.scratch.seq.len() != self.scratch.qual.len() {
-            return Err(FastqError::LengthMismatch {
-                offset: qual_start,
-                seq_len: self.scratch.seq.len(),
-                qual_len: self.scratch.qual.len(),
-            });
-        }
-
-        validate(
-            self.validation,
-            self.alphabet,
-            &self.scratch.seq,
-            &self.scratch.qual,
-            seq_start,
-            qual_start,
-        )?;
-
+        self.records = record_index;
         Ok(Some(FastqRecord::new(
             &self.scratch.header,
             &self.scratch.seq,
@@ -153,64 +113,139 @@ impl<R: AsyncBufRead + Unpin + Send> AsyncFastqReader<R> {
         )))
     }
 
-    async fn next_multi(&mut self) -> Result<Option<FastqRecord<'_>>, FastqError> {
-        let header_start = self.logical_offset;
-        match read_line(&mut self.inner, &mut self.scratch.header, &mut self.logical_offset).await?
-        {
-            LineStatus::Line => {}
-            LineStatus::EofClean => return Ok(None),
-            LineStatus::EofPartial => {
-                return Err(FastqError::UnexpectedEof {
-                    offset: header_start,
-                });
+    /// Read a header line, skipping blank lines. `false` means clean end of input.
+    async fn read_header(&mut self) -> Result<Option<u64>, FastqError> {
+        loop {
+            let start = self.logical_offset;
+            match read_line(
+                &mut self.inner,
+                &mut self.scratch.header,
+                &mut self.logical_offset,
+            )
+            .await?
+            {
+                LineStatus::Line | LineStatus::EofPartial => {}
+                LineStatus::EofClean => return Ok(None),
             }
+            if self.scratch.header.is_empty() {
+                continue;
+            }
+            if self.scratch.header[0] != b'@' {
+                return Err(FastqError::invalid(start, InvalidKind::HeaderMissingAt));
+            }
+            self.scratch.header.drain(..1);
+            return Ok(Some(start));
         }
-        if self.scratch.header.is_empty() || self.scratch.header[0] != b'@' {
-            return Err(FastqError::InvalidFormat {
-                offset: header_start,
-                kind: InvalidKind::HeaderMissingAt,
-            });
+    }
+
+    async fn next_single(&mut self, _record: u64) -> Result<bool, FastqError> {
+        if self.read_header().await?.is_none() {
+            return Ok(false);
         }
-        self.scratch.header.drain(..1);
+
+        let seq_start = self.logical_offset;
+        if read_line(
+            &mut self.inner,
+            &mut self.scratch.seq,
+            &mut self.logical_offset,
+        )
+        .await?
+            == LineStatus::EofClean
+        {
+            return Err(FastqError::eof(seq_start));
+        }
+
+        let plus_start = self.logical_offset;
+        if read_line(
+            &mut self.inner,
+            &mut self.scratch.plus,
+            &mut self.logical_offset,
+        )
+        .await?
+            == LineStatus::EofClean
+        {
+            return Err(FastqError::eof(plus_start));
+        }
+        if self.scratch.plus.first() != Some(&b'+') {
+            return Err(FastqError::invalid(plus_start, InvalidKind::PlusMissing));
+        }
+
+        let qual_start = self.logical_offset;
+        if read_line(
+            &mut self.inner,
+            &mut self.scratch.qual,
+            &mut self.logical_offset,
+        )
+        .await?
+            == LineStatus::EofClean
+        {
+            return Err(FastqError::eof(qual_start));
+        }
+
+        if self.scratch.seq.len() != self.scratch.qual.len() {
+            return Err(FastqError::length_mismatch(
+                qual_start,
+                self.scratch.seq.len(),
+                self.scratch.qual.len(),
+            ));
+        }
+
+        validate(
+            self.validation,
+            self.alphabet,
+            self.quality,
+            &self.scratch.seq,
+            &self.scratch.qual,
+            seq_start,
+            qual_start,
+        )?;
+        Ok(true)
+    }
+
+    async fn next_multi(&mut self, _record: u64) -> Result<bool, FastqError> {
+        if self.read_header().await?.is_none() {
+            return Ok(false);
+        }
 
         self.scratch.seq.clear();
         self.seq_segs.clear();
         let seq_start = self.logical_offset;
-        let plus_start;
         let mut tmp = std::mem::take(&mut self.scratch.plus);
+        let outcome = self.read_body(&mut tmp, seq_start).await;
+        self.scratch.plus = tmp;
+        let qual_start = outcome?;
+
+        validate(
+            self.validation,
+            self.alphabet,
+            self.quality,
+            &self.scratch.seq,
+            &self.scratch.qual,
+            seq_start,
+            qual_start,
+        )?;
+        Ok(true)
+    }
+
+    /// Sequence lines up to the `+` line, then quality lines. Returns the quality offset.
+    async fn read_body(&mut self, tmp: &mut Vec<u8>, _seq_start: u64) -> Result<u64, FastqError> {
         loop {
             let line_start = self.logical_offset;
-            tmp.clear();
-            match read_line(&mut self.inner, &mut tmp, &mut self.logical_offset).await? {
-                LineStatus::Line => {}
-                LineStatus::EofClean | LineStatus::EofPartial => {
-                    self.scratch.plus = tmp;
-                    return Err(FastqError::UnexpectedEof { offset: line_start });
-                }
+            if read_line(&mut self.inner, tmp, &mut self.logical_offset).await?
+                == LineStatus::EofClean
+            {
+                return Err(FastqError::eof(line_start));
             }
-            if tmp.is_empty() {
-                self.scratch.plus = tmp;
-                return Err(FastqError::InvalidFormat {
-                    offset: line_start,
-                    kind: InvalidKind::SeqLineEmpty,
-                });
-            }
-            if tmp[0] == b'+' {
-                plus_start = line_start;
+            if tmp.first() == Some(&b'+') {
                 break;
             }
-            self.scratch.seq.extend_from_slice(&tmp);
+            if tmp.is_empty() {
+                return Err(FastqError::invalid(line_start, InvalidKind::SeqLineEmpty));
+            }
+            self.scratch.seq.extend_from_slice(tmp);
             self.seq_segs.push(Segment {
                 offset: line_start,
                 len: tmp.len(),
-            });
-        }
-        self.scratch.plus = tmp;
-
-        if self.scratch.seq.is_empty() {
-            return Err(FastqError::InvalidFormat {
-                offset: plus_start,
-                kind: InvalidKind::SeqLineEmpty,
             });
         }
 
@@ -218,75 +253,56 @@ impl<R: AsyncBufRead + Unpin + Send> AsyncFastqReader<R> {
         self.scratch.qual.clear();
         self.qual_segs.clear();
         let mut remaining = self.scratch.seq.len();
-        let mut tmp = std::mem::take(&mut self.scratch.plus);
+        if remaining == 0 {
+            if read_line(&mut self.inner, tmp, &mut self.logical_offset).await?
+                == LineStatus::EofClean
+            {
+                return Err(FastqError::eof(qual_start));
+            }
+            if !tmp.is_empty() {
+                return Err(FastqError::length_mismatch(qual_start, 0, tmp.len()));
+            }
+            return Ok(qual_start);
+        }
         while remaining > 0 {
             let line_start = self.logical_offset;
-            tmp.clear();
-            match read_line(&mut self.inner, &mut tmp, &mut self.logical_offset).await? {
-                LineStatus::Line => {}
-                LineStatus::EofClean | LineStatus::EofPartial => {
-                    self.scratch.plus = tmp;
-                    return Err(FastqError::UnexpectedEof { offset: line_start });
-                }
+            if read_line(&mut self.inner, tmp, &mut self.logical_offset).await?
+                == LineStatus::EofClean
+            {
+                return Err(FastqError::eof(line_start));
             }
             if tmp.is_empty() {
-                self.scratch.plus = tmp;
-                return Err(FastqError::InvalidFormat {
-                    offset: line_start,
-                    kind: InvalidKind::QualLineEmpty,
-                });
+                return Err(FastqError::invalid(line_start, InvalidKind::QualLineEmpty));
             }
             if tmp.len() > remaining {
-                let qlen = self.scratch.qual.len() + tmp.len();
-                self.scratch.plus = tmp;
-                return Err(FastqError::LengthMismatch {
-                    offset: line_start,
-                    seq_len: self.scratch.seq.len(),
-                    qual_len: qlen,
-                });
+                return Err(FastqError::length_mismatch(
+                    line_start,
+                    self.scratch.seq.len(),
+                    self.scratch.qual.len() + tmp.len(),
+                ));
             }
-            self.scratch.qual.extend_from_slice(&tmp);
+            self.scratch.qual.extend_from_slice(tmp);
             self.qual_segs.push(Segment {
                 offset: line_start,
                 len: tmp.len(),
             });
             remaining -= tmp.len();
         }
-        self.scratch.plus = tmp;
-
-        validate(
-            self.validation,
-            self.alphabet,
-            &self.scratch.seq,
-            &self.scratch.qual,
-            seq_start,
-            qual_start,
-        )?;
-
-        Ok(Some(FastqRecord::new(
-            &self.scratch.header,
-            &self.scratch.seq,
-            &self.scratch.qual,
-        )))
+        Ok(qual_start)
     }
 }
 
 impl<R: AsyncBufRead + Unpin + Send + 'static> AsyncFastqReader<R> {
-    /// Convert the reader into a [`Stream`] of owned records. Use when records must
-    /// outlive `next()` calls (channel sends, async pipelines, axum responses).
-    /// Per-record allocation is the cost of moving from borrowed to owned.
+    /// Convert into a [`Stream`](futures_util::Stream) of owned records, for channel sends and
+    /// async pipelines. One allocation per field per record is the price of owning them.
     pub fn records(self) -> RecordStream<R> {
         RecordStream::new(self)
     }
 }
 
-/// Path-based async reader: an enum that dispatches between plain and gzip variants
-/// at runtime. Keeps each variant statically typed (no `Box<dyn AsyncBufRead>`).
-///
-/// Construct via [`AnyAsyncReader::from_path`].
+/// Path-based async reader: plain or gzip, chosen by magic bytes, each variant statically typed.
 //
-// The variants differ by ~250 B (gzip stack carries a `GzipDecoder` plus an extra
-// `BufReader`); boxing would just add an indirection on the per-record hot path.
+// The variants differ by a few hundred bytes; boxing would add an indirection per record.
 #[allow(clippy::large_enum_variant)]
 pub enum AnyAsyncReader {
     Plain(AsyncFastqReader<BufReader<File>>),
@@ -294,24 +310,49 @@ pub enum AnyAsyncReader {
 }
 
 impl AnyAsyncReader {
-    /// Open a path with magic-byte sniffing for gzip. BGZF is decoded as gzip on this path
-    /// (no virtual-offset semantics).
+    /// Open a path, sniffing gzip from the magic bytes.
+    ///
+    /// BGZF is decoded here as ordinary gzip, which is valid but drops virtual-offset
+    /// semantics: multi-member decoding is enabled, so every block is read. For true BGZF
+    /// semantics use the sync reader or wrap a `noodles_bgzf` async reader with
+    /// [`AsyncFastqReader::from_reader`].
     pub async fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, FastqError> {
         let path = path.as_ref();
         let mut file = File::open(path).await.map_err(FastqError::Io)?;
-        let mut magic = [0u8; 2];
-        let peeked = match file.read_exact(&mut magic).await {
-            Ok(_) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
-            Err(e) => return Err(FastqError::Io(e)),
-        };
+        let mut magic = [0u8; 6];
+        let mut filled = 0usize;
+        while filled < magic.len() {
+            let n = file
+                .read(&mut magic[filled..])
+                .await
+                .map_err(FastqError::Io)?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
         drop(file);
-        // We re-open to reset the stream position rather than keeping a holding buffer —
-        // a single extra `open(2)` is negligible compared to the per-record cost.
+
+        let head = &magic[..filled];
+        if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+            return Err(FastqError::Unsupported(UnsupportedOperation::Zstd));
+        }
+        if head.starts_with(b"BZh") {
+            return Err(FastqError::Unsupported(UnsupportedOperation::Bzip2));
+        }
+        if head.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+            return Err(FastqError::Unsupported(UnsupportedOperation::Xz));
+        }
+
+        // Re-open to rewind: one extra `open` is nothing next to the per-record cost.
         let file = File::open(path).await.map_err(FastqError::Io)?;
         let buffered = BufReader::with_capacity(256 * 1024, file);
-        if peeked && magic == [0x1f, 0x8b] {
-            let decoder = GzipDecoder::new(buffered);
+        if filled >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+            let mut decoder = GzipDecoder::new(buffered);
+            // gzip files in bioinformatics are routinely concatenations of members: bgzip emits
+            // one per 64 KiB block, pigz one per chunk. Without this the reader stops after the
+            // first member and silently drops the rest of the file.
+            decoder.multiple_members(true);
             let buffered = BufReader::with_capacity(256 * 1024, decoder);
             return Ok(AnyAsyncReader::Gzip(AsyncFastqReader::from_reader(
                 buffered,
@@ -322,10 +363,19 @@ impl AnyAsyncReader {
         )))
     }
 
+    /// Read the next record. Not cancel-safe; see [`AsyncFastqReader`].
     pub async fn next(&mut self) -> Result<Option<FastqRecord<'_>>, FastqError> {
         match self {
             Self::Plain(r) => r.next().await,
             Self::Gzip(r) => r.next().await,
+        }
+    }
+
+    /// Number of records returned so far.
+    pub fn records_read(&self) -> u64 {
+        match self {
+            Self::Plain(r) => r.records_read(),
+            Self::Gzip(r) => r.records_read(),
         }
     }
 
@@ -343,6 +393,13 @@ impl AnyAsyncReader {
         }
     }
 
+    pub fn with_quality_encoding(self, encoding: QualityEncoding) -> Self {
+        match self {
+            Self::Plain(r) => Self::Plain(r.with_quality_encoding(encoding)),
+            Self::Gzip(r) => Self::Gzip(r.with_quality_encoding(encoding)),
+        }
+    }
+
     pub fn with_format(self, format: FastqFormat) -> Self {
         match self {
             Self::Plain(r) => Self::Plain(r.with_format(format)),
@@ -351,17 +408,10 @@ impl AnyAsyncReader {
     }
 }
 
-/// Stream wrapper yielding owned records. Constructed via
-/// [`AsyncFastqReader::records`].
+/// Stream of owned records, from [`AsyncFastqReader::records`].
 pub struct RecordStream<R: AsyncBufRead + Unpin + Send + 'static> {
     #[allow(clippy::type_complexity)]
-    inner: Pin<
-        Box<
-            dyn Stream<Item = Result<FastqRecordOwned, FastqError>>
-                + Send
-                + 'static,
-        >,
-    >,
+    inner: Pin<Box<dyn Stream<Item = Result<FastqRecordOwned, FastqError>> + Send + 'static>>,
     _marker: std::marker::PhantomData<R>,
 }
 
@@ -396,16 +446,18 @@ impl<R: AsyncBufRead + Unpin + Send + 'static> Stream for RecordStream<R> {
     }
 }
 
-/// Internal async line reader. Uses tokio's `read_until` (which uses `memchr::memchr`
-/// under the hood — still SIMD-y, just not our AVX-512 path; the syscall cost dominates
-/// async I/O anyway).
+/// Read one line, stripping `\n` and an optional preceding `\r`. A final line without a
+/// terminator is reported as [`LineStatus::EofPartial`] and treated as a line by the callers.
 async fn read_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     out: &mut Vec<u8>,
     logical_offset: &mut u64,
 ) -> Result<LineStatus, FastqError> {
     out.clear();
-    let n = reader.read_until(b'\n', out).await.map_err(FastqError::Io)?;
+    let n = reader
+        .read_until(b'\n', out)
+        .await
+        .map_err(FastqError::Io)?;
     if n == 0 {
         return Ok(LineStatus::EofClean);
     }
@@ -427,6 +479,7 @@ async fn read_line<R: AsyncBufRead + Unpin>(
 fn validate(
     mode: ValidationMode,
     alphabet: Alphabet,
+    quality: QualityEncoding,
     seq: &[u8],
     qual: &[u8],
     seq_start: u64,
@@ -435,10 +488,10 @@ fn validate(
     match mode {
         ValidationMode::None => Ok(()),
         ValidationMode::Bases => check_bases(seq, alphabet, seq_start),
-        ValidationMode::Qualities => check_qual(qual, qual_start),
+        ValidationMode::Qualities => check_qual(qual, quality, qual_start),
         ValidationMode::BasesAndQualities => {
             check_bases(seq, alphabet, seq_start)?;
-            check_qual(qual, qual_start)
+            check_qual(qual, quality, qual_start)
         }
     }
 }
@@ -447,20 +500,14 @@ fn validate(
 fn check_bases(seq: &[u8], alphabet: Alphabet, base: u64) -> Result<(), FastqError> {
     match validate_bases_with(seq, alphabet) {
         Ok(()) => Ok(()),
-        Err(idx) => Err(FastqError::InvalidBase {
-            offset: base + idx as u64,
-            byte: seq[idx],
-        }),
+        Err(idx) => Err(FastqError::invalid_base(base + idx as u64, seq[idx])),
     }
 }
 
 #[inline]
-fn check_qual(qual: &[u8], base: u64) -> Result<(), FastqError> {
-    match validate_qual(qual) {
+fn check_qual(qual: &[u8], encoding: QualityEncoding, base: u64) -> Result<(), FastqError> {
+    match validate_qual_encoding(qual, encoding) {
         Ok(()) => Ok(()),
-        Err(idx) => Err(FastqError::InvalidQuality {
-            offset: base + idx as u64,
-            byte: qual[idx],
-        }),
+        Err(idx) => Err(FastqError::invalid_quality(base + idx as u64, qual[idx])),
     }
 }

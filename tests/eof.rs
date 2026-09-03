@@ -12,7 +12,7 @@ fn unexpected_eof() {
     let err = reader.next().expect_err("should error");
     let len = std::fs::read(path).expect("read").len() as u64;
     match err {
-        FastqError::UnexpectedEof { offset } => {
+        FastqError::UnexpectedEof { offset, .. } => {
             assert_eq!(offset, len);
         }
         other => panic!("unexpected error: {other:?}"),
@@ -26,7 +26,7 @@ fn unexpected_eof_gzip() {
     let mut reader = FastqReader::from_path(&path).expect("open");
     let err = reader.next().expect_err("should error");
     match err {
-        FastqError::UnexpectedEof { offset } => {
+        FastqError::UnexpectedEof { offset, .. } => {
             assert_eq!(offset, 11);
         }
         other => panic!("unexpected error: {other:?}"),

@@ -6,11 +6,15 @@ use kira_fastq::{FastqError, FastqReader, InvalidKind};
 fn fastq_error_implements_std_error() {
     let err: FastqError = FastqError::InvalidFormat {
         offset: 42,
+        record: 7,
         kind: InvalidKind::HeaderMissingAt,
     };
     let s = format!("{err}");
-    assert!(s.contains("invalid FASTQ format"));
+    assert!(s.contains("invalid FASTQ"));
     assert!(s.contains("42"));
+    assert!(s.contains("record 7"));
+    assert_eq!(err.record(), Some(7));
+    assert_eq!(err.offset(), Some(42));
     let dyn_err: &dyn std::error::Error = &err;
     let _ = dyn_err.source();
 }

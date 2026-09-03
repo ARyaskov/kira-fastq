@@ -7,10 +7,7 @@ use kira_fastq::{
 #[test]
 fn plain_roundtrip_via_path() {
     let in_path = common::unique_path("in.fastq");
-    common::write_plain(
-        &in_path,
-        b"@r1 lib=A\nACGT\n+\n!!!!\n@r2\nGGGG\n+\n@@@@\n",
-    );
+    common::write_plain(&in_path, b"@r1 lib=A\nACGT\n+\n!!!!\n@r2\nGGGG\n+\n@@@@\n");
 
     let out_path = common::unique_path("out.fastq");
     let mut writer = FastqWriter::from_path(&out_path).expect("open writer");

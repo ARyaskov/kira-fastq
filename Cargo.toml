@@ -1,31 +1,33 @@
 [package]
 name = "kira-fastq"
-description = "High-performance FASTQ reader and writer with mmap-first design. Supports plain, gzip, and BGZF inputs/outputs; optional multi-line parsing; explicit paired-end reading; sync and async APIs; optional `noodles-bgzf` interop."
-version = "0.3.0"
+description = "High-performance FASTQ reader and writer: plain, gzip and BGZF (single- or multi-threaded), mmap or streaming input, multi-line records, paired-end and interleaved reading, sync and async APIs, optional `noodles-bgzf` interop."
+version = "0.4.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/ARyaskov/kira-fastq"
 keywords = [
+    "fastq",
     "bioinformatics",
     "genomics",
-    "sequence-alignment"
+    "bgzf",
+    "sequencing"
 ]
 categories = [
     "science",
     "science::bioinformatics",
     "science::bioinformatics::sequence-analysis",
-    "command-line-utilities"
+    "parser-implementations"
 ]
 
 [dependencies]
 memmap2 = "0.9"
-miniz_oxide = "0.9"
 memchr = "2.7"
 crc32fast = "1.5"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 
 libdeflater = { version = "1.23", optional = true }
+zstd = { version = "0.13", optional = true }
 
 tokio = { version = "1", optional = true, default-features = false, features = ["io-util", "fs", "rt"] }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
@@ -35,15 +37,16 @@ noodles-bgzf = { version = "0.47", optional = true }
 
 [dev-dependencies]
 criterion = "0.8"
-flate2 = "1.1"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 crc32fast = "1.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "fs"] }
 futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
+noodles-bgzf = "0.47"
 
 [features]
 default = []
-gzip-validate = []
 libdeflate = ["dep:libdeflater"]
+zstd = ["dep:zstd"]
 async = ["dep:tokio", "dep:futures-util", "dep:async-compression"]
 noodles-bgzf = ["dep:noodles-bgzf"]
 
@@ -61,6 +64,10 @@ harness = false
 
 [[bench]]
 name = "end_to_end"
+harness = false
+
+[[bench]]
+name = "validation"
 harness = false
 
 [lints.rust]

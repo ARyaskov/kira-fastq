@@ -1,3 +1,8 @@
+//! Vectorised helpers used on the parsing and validation hot paths.
+//!
+//! Every kernel here has a scalar fallback and is selected at runtime, so a binary built for a
+//! baseline target still uses the widest kernel the CPU it runs on supports.
+
 pub mod bases;
 pub mod newline;
 pub mod qual;
@@ -7,7 +12,6 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone, Copy, Default)]
 #[allow(dead_code)]
 pub(crate) struct CpuFeatures {
-    pub avx512bw: bool,
     pub avx2: bool,
     pub sse2: bool,
     pub neon: bool,
@@ -26,7 +30,6 @@ fn detect_cpu_features() -> CpuFeatures {
 
     #[cfg(target_arch = "x86_64")]
     {
-        f.avx512bw = std::arch::is_x86_feature_detected!("avx512bw");
         f.avx2 = std::arch::is_x86_feature_detected!("avx2");
         f.sse2 = std::arch::is_x86_feature_detected!("sse2");
     }

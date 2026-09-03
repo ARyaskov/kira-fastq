@@ -5,24 +5,28 @@ use async_compression::tokio::write::GzipEncoder;
 use tokio::fs::File;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 
-use crate::error::FastqError;
+use crate::error::{FastqError, InvalidKind, UnsupportedOperation};
 use crate::record::{FastqRecord, FastqRecordOwned};
 use crate::simd::bases::validate_bases_with;
-use crate::simd::qual::validate_qual;
-use crate::validation::Alphabet;
+use crate::simd::newline::contains_line_break;
+use crate::simd::qual::validate_qual_encoding;
+use crate::validation::{Alphabet, QualityEncoding};
 use crate::writer::{WriteValidation, assemble_record};
 
 const DEFAULT_WRITE_BUF: usize = 1024 * 1024;
 const DEFAULT_GZIP_LEVEL: u32 = 6;
 
-/// Async FASTQ writer over any `AsyncWrite`. Same single-syscall-per-record discipline
-/// as the sync writer: each record is assembled into a scratch buffer and emitted with
-/// one `write_all().await`.
+/// Async FASTQ writer over any `AsyncWrite`.
+///
+/// Same discipline as the sync writer: one `write_all` per record, structural checks on every
+/// record, opt-in content validation. Call [`AsyncFastqWriter::shutdown`] before dropping a
+/// compressed writer, otherwise the trailer is never written.
 pub struct AsyncFastqWriter<W: AsyncWrite + Unpin + Send> {
     inner: W,
     scratch: Vec<u8>,
     validation: WriteValidation,
     alphabet: Alphabet,
+    quality: QualityEncoding,
 }
 
 impl<W: AsyncWrite + Unpin + Send> AsyncFastqWriter<W> {
@@ -33,6 +37,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncFastqWriter<W> {
             scratch: Vec::with_capacity(8 * 1024),
             validation: WriteValidation::None,
             alphabet: Alphabet::default(),
+            quality: QualityEncoding::default(),
         }
     }
 
@@ -48,20 +53,18 @@ impl<W: AsyncWrite + Unpin + Send> AsyncFastqWriter<W> {
         self
     }
 
-    pub async fn write_record(&mut self, rec: &FastqRecord<'_>) -> Result<(), FastqError> {
-        self.validate(rec.seq(), rec.qual())?;
-        assemble_record(&mut self.scratch, rec.header(), rec.seq(), rec.qual());
-        self.inner
-            .write_all(&self.scratch)
-            .await
-            .map_err(FastqError::Io)
+    #[inline]
+    pub fn with_quality_encoding(mut self, encoding: QualityEncoding) -> Self {
+        self.quality = encoding;
+        self
     }
 
-    pub async fn write_record_owned(
-        &mut self,
-        rec: &FastqRecordOwned,
-    ) -> Result<(), FastqError> {
-        self.write_record(&rec.as_borrowed()).await
+    pub async fn write_record(&mut self, rec: &FastqRecord<'_>) -> Result<(), FastqError> {
+        self.write_parts(rec.header(), rec.seq(), rec.qual()).await
+    }
+
+    pub async fn write_record_owned(&mut self, rec: &FastqRecordOwned) -> Result<(), FastqError> {
+        self.write_parts(rec.header(), rec.seq(), rec.qual()).await
     }
 
     pub async fn write_parts(
@@ -70,7 +73,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncFastqWriter<W> {
         seq: &[u8],
         qual: &[u8],
     ) -> Result<(), FastqError> {
-        self.validate(seq, qual)?;
+        self.validate(header, seq, qual)?;
         assemble_record(&mut self.scratch, header, seq, qual);
         self.inner
             .write_all(&self.scratch)
@@ -78,13 +81,13 @@ impl<W: AsyncWrite + Unpin + Send> AsyncFastqWriter<W> {
             .map_err(FastqError::Io)
     }
 
-    /// Flush the encoder/buffer. For gzip output you also want [`Self::shutdown`] at the
-    /// end to flush the final deflate block + trailer.
+    /// Flush buffered bytes. For gzip output the trailer is still pending; see
+    /// [`AsyncFastqWriter::shutdown`].
     pub async fn flush(&mut self) -> Result<(), FastqError> {
         self.inner.flush().await.map_err(FastqError::Io)
     }
 
-    /// Final flush + close. Required for gzip/BGZF output to be valid.
+    /// Final flush and close. Required for compressed output to be valid.
     pub async fn shutdown(&mut self) -> Result<(), FastqError> {
         self.inner.shutdown().await.map_err(FastqError::Io)
     }
@@ -104,34 +107,47 @@ impl<W: AsyncWrite + Unpin + Send> AsyncFastqWriter<W> {
         &mut self.inner
     }
 
-    #[inline]
-    fn validate(&self, seq: &[u8], qual: &[u8]) -> Result<(), FastqError> {
+    fn validate(&self, header: &[u8], seq: &[u8], qual: &[u8]) -> Result<(), FastqError> {
+        if seq.len() != qual.len() {
+            return Err(FastqError::length_mismatch(0, seq.len(), qual.len()));
+        }
+        if contains_line_break(header) {
+            return Err(FastqError::invalid(0, InvalidKind::HeaderContainsNewline));
+        }
+        if self.validation == WriteValidation::None {
+            return Ok(());
+        }
+        if contains_line_break(seq) {
+            return Err(FastqError::invalid(0, InvalidKind::SeqContainsNewline));
+        }
+        if contains_line_break(qual) {
+            return Err(FastqError::invalid(0, InvalidKind::QualContainsNewline));
+        }
         match self.validation {
-            WriteValidation::None => Ok(()),
+            WriteValidation::None | WriteValidation::LineBreaks => Ok(()),
             WriteValidation::Bases => check_bases(seq, self.alphabet),
-            WriteValidation::Qualities => check_qual(qual),
+            WriteValidation::Qualities => check_qual(qual, self.quality),
             WriteValidation::BasesAndQualities => {
                 check_bases(seq, self.alphabet)?;
-                check_qual(qual)
+                check_qual(qual, self.quality)
             }
         }
     }
 }
 
-/// Type-erased async writer (returned by path-based constructors). Hides the gzip-vs-plain
-/// generic split behind a `Pin<Box<dyn AsyncWrite>>`.
+/// Type-erased async writer returned by the path constructor.
 pub type BoxedAsyncWriter = AsyncFastqWriter<Pin<Box<dyn AsyncWrite + Send + Unpin>>>;
 
 impl AsyncFastqWriter<Pin<Box<dyn AsyncWrite + Send + Unpin>>> {
-    /// Open an output path. `.gz` triggers gzip via `async-compression`. BGZF is not
-    /// supported on this async path (use the sync writer or wrap a `noodles_bgzf::AsyncWriter`).
+    /// Open an output path. `.gz` selects streaming gzip. BGZF and zstd are not available on
+    /// the async path; use the sync writer, which supports both.
     pub async fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, FastqError> {
         let path = path.as_ref();
         if is_bgzf(path) {
-            return Err(FastqError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "BGZF async output is not supported; use sync writer or wrap noodles_bgzf::AsyncWriter via from_writer",
-            )));
+            return Err(FastqError::Unsupported(UnsupportedOperation::AsyncBgzf));
+        }
+        if is_zst(path) {
+            return Err(FastqError::Unsupported(UnsupportedOperation::Zstd));
         }
         let file = File::create(path).await.map_err(FastqError::Io)?;
         let buffered = BufWriter::with_capacity(DEFAULT_WRITE_BUF, file);
@@ -151,34 +167,40 @@ impl AsyncFastqWriter<Pin<Box<dyn AsyncWrite + Send + Unpin>>> {
 
 #[inline]
 fn is_gz(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
+    has_extension(path, &["gz"])
 }
 
 #[inline]
 fn is_bgzf(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("bgz") || ext.eq_ignore_ascii_case("bgzf"))
+    has_extension(path, &["bgz", "bgzf"])
+}
+
+#[inline]
+fn is_zst(path: &Path) -> bool {
+    has_extension(path, &["zst", "zstd"])
+}
+
+#[inline]
+fn has_extension(path: &Path, wanted: &[&str]) -> bool {
+    path.extension().is_some_and(|ext| {
+        wanted
+            .iter()
+            .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+    })
 }
 
 #[inline]
 fn check_bases(seq: &[u8], alphabet: Alphabet) -> Result<(), FastqError> {
     match validate_bases_with(seq, alphabet) {
         Ok(()) => Ok(()),
-        Err(idx) => Err(FastqError::InvalidBase {
-            offset: idx as u64,
-            byte: seq[idx],
-        }),
+        Err(idx) => Err(FastqError::invalid_base(idx as u64, seq[idx])),
     }
 }
 
 #[inline]
-fn check_qual(qual: &[u8]) -> Result<(), FastqError> {
-    match validate_qual(qual) {
+fn check_qual(qual: &[u8], encoding: QualityEncoding) -> Result<(), FastqError> {
+    match validate_qual_encoding(qual, encoding) {
         Ok(()) => Ok(()),
-        Err(idx) => Err(FastqError::InvalidQuality {
-            offset: idx as u64,
-            byte: qual[idx],
-        }),
+        Err(idx) => Err(FastqError::invalid_quality(idx as u64, qual[idx])),
     }
 }

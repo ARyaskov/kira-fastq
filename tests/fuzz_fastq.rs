@@ -114,7 +114,7 @@ fn fuzz_error_offsets_monotonic() {
                 Err(err) => {
                     let off = match err {
                         FastqError::InvalidFormat { offset, .. } => offset,
-                        FastqError::UnexpectedEof { offset } => offset,
+                        FastqError::UnexpectedEof { offset, .. } => offset,
                         FastqError::LengthMismatch { offset, .. } => offset,
                         FastqError::InvalidBase { offset, .. } => offset,
                         FastqError::InvalidQuality { offset, .. } => offset,
